@@ -1,0 +1,31 @@
+# TaskNexus Agent 配置示例
+
+# WebSocket 服务器地址
+server: ws://localhost:8001/ws/agent/
+
+# Agent 认证 Token (从 TaskNexus 服务器获取)
+token: YOUR_AGENT_TOKEN_HERE
+
+# Agent 名称 (可选，默认使用主机名)
+# name: my-agent
+
+# 工作目录 (可选，默认: ./workdir)
+workdir: ./workdir
+
+# 日志级别 (可选: DEBUG, INFO, WARNING, ERROR)
+log_level: INFO
+
+# 日志文件路径 (可选，不设置则只输出到控制台)
+# log_file: ./logs/agent.log
+
+# 心跳间隔 (秒)
+heartbeat_interval: 30
+
+# 重连间隔 (秒)
+reconnect_interval: 5
+
+# 最大重连次数 (-1 表示无限重试)
+max_reconnect_attempts: -1
+
+# 默认任务超时 (秒)
+task_timeout: 3600
