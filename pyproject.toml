@@ -1,5 +1,5 @@
 [project]
-name = "tasknexus-agent"
+name = "tasknexus-client-agent"
 version = "0.1.0"
 description = "TaskNexus 客户端代理 - 连接到 TaskNexus 服务器执行远程任务"
 readme = "README.md"
@@ -38,7 +38,7 @@ dev = [
 ]
 
 [project.scripts]
-tasknexus-agent = "agent.main:main"
+tasknexus-client-agent = "agent.main:main"
 
 [build-system]
 requires = ["hatchling"]

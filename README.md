@@ -15,14 +15,14 @@ TaskNexus 客户端代理应用程序，用于连接 TaskNexus 服务器并执�
 ### 从源码安装
 
 ```bash
-cd tasknexus_agent
+cd tasknexus-client-agent
 pip install -e .
 ```
 
 ### 使用 pip 安装
 
 ```bash
-pip install tasknexus-agent
+pip install tasknexus-client-agent
 ```
 
 ## 使用方法
@@ -31,10 +31,10 @@ pip install tasknexus-agent
 
 ```bash
 # 基本启动
-tasknexus-agent --server ws://localhost:8001/ws/agent/ --token YOUR_TOKEN
+tasknexus-client-agent --server ws://localhost:8001/ws/agent/ --token YOUR_TOKEN
 
 # 完整参数
-tasknexus-agent \
+tasknexus-client-agent \
     --server ws://your-server:8001/ws/agent/ \
     --token YOUR_AGENT_TOKEN \
     --name my-agent \
@@ -58,7 +58,7 @@ heartbeat_interval: 30
 然后启动:
 
 ```bash
-tasknexus-agent --config config.yaml
+tasknexus-client-agent --config config.yaml
 ```
 
 ## 配置选项
