@@ -209,27 +209,10 @@ class CommandExecutor:
 
 
 class TaskRunner:
-    """
-    任务运行器
-    
-    组合 Git 管理器和命令执行器来运行完整任务。
-    """
-    
     def __init__(self, workspaces_path: Path, executor: Optional[CommandExecutor] = None):
-        """
-        初始化任务运行器
-        
-        Args:
-            workspaces_path: 工作空间根目录
-            executor: 命令执行器实例
-        """
         self.workspaces_path = workspaces_path
         self.executor = executor or CommandExecutor()
         self.workspaces_path.mkdir(parents=True, exist_ok=True)
-        
-        # 延迟导入，避免循环依赖
-        from .git_manager import GitManager
-        self.git_manager = GitManager(workspaces_path)
     
     async def run_task(
         self,
