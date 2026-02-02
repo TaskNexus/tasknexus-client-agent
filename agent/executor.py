@@ -238,10 +238,7 @@ class TaskRunner:
         workspace_name: str = "default",
         client_repo_url: Optional[str] = None,
         client_repo_ref: str = "main",
-        parameters: Optional[Dict] = None,
-        environment: Optional[Dict[str, str]] = None,
         timeout: int = 3600,
-        working_dir: Optional[str] = None,
         on_output: Optional[callable] = None,
     ) -> ExecutionResult:
         """
@@ -253,10 +250,7 @@ class TaskRunner:
             workspace_name: 工作空间名称
             client_repo_url: Git 仓库 URL
             client_repo_ref: 分支或提交
-            parameters: 命令参数（JSON 格式）
-            environment: 环境变量
             timeout: 超时时间
-            working_dir: 工作目录（相对于仓库根目录）
             on_output: 输出回调
         
         Returns:
@@ -264,7 +258,6 @@ class TaskRunner:
         """
         logger.info(f"Running task {task_id} in workspace '{workspace_name}': {command}")
         logger.info(f"[DEBUG] client_repo_url={client_repo_url}, client_repo_ref={client_repo_ref}")
-        logger.info(f"[DEBUG] working_dir={working_dir}")
         
         # 获取/创建工作空间目录
         workspace_dir = self.workspaces_path / workspace_name
@@ -305,27 +298,11 @@ class TaskRunner:
             
             exec_dir = repo_path
         
-        # 如果指定了工作目录，切换到该目录
-        if working_dir:
-            exec_dir = exec_dir / working_dir
-            if not exec_dir.exists():
-                logger.error(f"Working directory does not exist: {exec_dir}")
-                return ExecutionResult(
-                    exit_code=-1,
-                    stdout='',
-                    stderr=f"Working directory does not exist: {working_dir}",
-                )
-        
-        # 合并环境变量
-        task_env = environment or {}
-        task_env['TASKNEXUS_TASK_ID'] = str(task_id)
-        task_env['TASKNEXUS_WORKSPACE'] = workspace_name
-        
-        # 如果有参数，将其添加到环境变量
-        if parameters:
-            for key, value in parameters.items():
-                if isinstance(value, (str, int, float, bool)):
-                    task_env[f"PARAM_{key.upper()}"] = str(value)
+        # 设置环境变量
+        task_env = {
+            'TASKNEXUS_TASK_ID': str(task_id),
+            'TASKNEXUS_WORKSPACE': workspace_name,
+        }
         
         # 执行命令
         result = await self.executor.execute(

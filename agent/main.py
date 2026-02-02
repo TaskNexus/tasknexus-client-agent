@@ -107,10 +107,7 @@ class Agent:
         command = message.get('command', '')
         client_repo_url = message.get('client_repo_url', '')
         client_repo_ref = message.get('client_repo_ref', 'main')
-        parameters = message.get('parameters', {})
-        environment = message.get('environment', {})
         timeout = message.get('timeout', 3600)
-        working_dir = message.get('working_dir', '')
         
         logger.info(f"Received task {task_id} for workspace '{workspace_name}': {command}")
         logger.info(f"[DEBUG] Received message keys: {list(message.keys())}")
@@ -142,10 +139,7 @@ class Agent:
                 workspace_name=workspace_name,
                 client_repo_url=client_repo_url if client_repo_url else None,
                 client_repo_ref=client_repo_ref,
-                parameters=parameters,
-                environment=environment,
                 timeout=timeout,
-                working_dir=working_dir if working_dir else None,
                 on_output=on_output,
             )
             
