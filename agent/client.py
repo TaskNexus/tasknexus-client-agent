@@ -48,9 +48,9 @@ class AgentClient:
     
     @property
     def ws_url(self) -> str:
-        """构建带 token 的 WebSocket URL"""
+        """构建带 name 的 WebSocket URL"""
         separator = "&" if "?" in self.config.server else "?"
-        return f"{self.config.server}{separator}token={self.config.token}"
+        return f"{self.config.server}{separator}name={self.config.name}"
     
     async def connect(self) -> bool:
         """

@@ -20,13 +20,12 @@ class AgentConfig:
     
     # 连接配置
     server: str = ""
-    token: str = ""
     
     # Agent 信息
     name: str = field(default_factory=lambda: socket.gethostname())
     
-    # 工作目录
-    workdir: Path = field(default_factory=lambda: Path("./workdir"))
+    # 工作目录配置
+    workspaces_path: Path = field(default_factory=lambda: Path("./workspaces"))
     
     # 日志配置
     log_level: str = "INFO"
@@ -44,8 +43,8 @@ class AgentConfig:
     
     def __post_init__(self):
         """初始化后处理"""
-        if isinstance(self.workdir, str):
-            self.workdir = Path(self.workdir)
+        if isinstance(self.workspaces_path, str):
+            self.workspaces_path = Path(self.workspaces_path)
         if isinstance(self.log_file, str):
             self.log_file = Path(self.log_file)
     
@@ -57,9 +56,8 @@ class AgentConfig:
         
         return cls(
             server=data.get('server', ''),
-            token=data.get('token', ''),
             name=data.get('name', socket.gethostname()),
-            workdir=Path(data.get('workdir', './workdir')),
+            workspaces_path=Path(data.get('workspaces_path', './workspaces')),
             log_level=data.get('log_level', 'INFO'),
             log_file=Path(data['log_file']) if data.get('log_file') else None,
             heartbeat_interval=data.get('heartbeat_interval', 30),
@@ -73,9 +71,8 @@ class AgentConfig:
         """从环境变量加载配置"""
         return cls(
             server=os.environ.get('TASKNEXUS_SERVER', ''),
-            token=os.environ.get('TASKNEXUS_TOKEN', ''),
             name=os.environ.get('TASKNEXUS_AGENT_NAME', socket.gethostname()),
-            workdir=Path(os.environ.get('TASKNEXUS_WORKDIR', './workdir')),
+            workspaces_path=Path(os.environ.get('TASKNEXUS_WORKSPACES_PATH', './workspaces')),
             log_level=os.environ.get('TASKNEXUS_LOG_LEVEL', 'INFO'),
             heartbeat_interval=int(os.environ.get('TASKNEXUS_HEARTBEAT_INTERVAL', '30')),
         )
@@ -86,9 +83,9 @@ class AgentConfig:
         
         if not self.server:
             errors.append("Server URL is required")
-        if not self.token:
-            errors.append("Token is required")
-        if not self.server.startswith(('ws://', 'wss://')):
+        if not self.name:
+            errors.append("Agent name is required")
+        if self.server and not self.server.startswith(('ws://', 'wss://')):
             errors.append("Server URL must start with ws:// or wss://")
         
         return errors
@@ -117,14 +114,17 @@ class AgentConfig:
             return ip
         except Exception:
             return "127.0.0.1"
+    
+    def get_workspace_path(self, workspace_name: str) -> Path:
+        """获取指定 workspace 的路径"""
+        return self.workspaces_path / workspace_name
 
 
 def load_config(
     config_file: Optional[str] = None,
     server: Optional[str] = None,
-    token: Optional[str] = None,
     name: Optional[str] = None,
-    workdir: Optional[str] = None,
+    workspaces_path: Optional[str] = None,
     log_level: Optional[str] = None,
     heartbeat_interval: Optional[int] = None,
 ) -> AgentConfig:
@@ -139,12 +139,10 @@ def load_config(
         file_config = AgentConfig.from_file(config_file)
         if file_config.server:
             config.server = file_config.server
-        if file_config.token:
-            config.token = file_config.token
         if file_config.name != socket.gethostname():
             config.name = file_config.name
-        if file_config.workdir != Path("./workdir"):
-            config.workdir = file_config.workdir
+        if file_config.workspaces_path != Path("./workspaces"):
+            config.workspaces_path = file_config.workspaces_path
         if file_config.log_level != "INFO":
             config.log_level = file_config.log_level
         if file_config.heartbeat_interval != 30:
@@ -153,12 +151,10 @@ def load_config(
     # 命令行参数覆盖
     if server:
         config.server = server
-    if token:
-        config.token = token
     if name:
         config.name = name
-    if workdir:
-        config.workdir = Path(workdir)
+    if workspaces_path:
+        config.workspaces_path = Path(workspaces_path)
     if log_level:
         config.log_level = log_level
     if heartbeat_interval:

@@ -215,27 +215,27 @@ class TaskRunner:
     组合 Git 管理器和命令执行器来运行完整任务。
     """
     
-    def __init__(self, workdir: Path, executor: Optional[CommandExecutor] = None):
+    def __init__(self, workspaces_path: Path, executor: Optional[CommandExecutor] = None):
         """
         初始化任务运行器
         
         Args:
-            workdir: 工作目录
+            workspaces_path: 工作空间根目录
             executor: 命令执行器实例
         """
-        self.workdir = workdir
+        self.workspaces_path = workspaces_path
         self.executor = executor or CommandExecutor()
-        self.repos_dir = workdir / "repos"
-        self.repos_dir.mkdir(parents=True, exist_ok=True)
+        self.workspaces_path.mkdir(parents=True, exist_ok=True)
         
         # 延迟导入，避免循环依赖
         from .git_manager import GitManager
-        self.git_manager = GitManager(workdir)
+        self.git_manager = GitManager(workspaces_path)
     
     async def run_task(
         self,
         task_id,  # Can be str (UUID) or int
         command: str,
+        workspace_name: str = "default",
         client_repo_url: Optional[str] = None,
         client_repo_ref: str = "main",
         parameters: Optional[Dict] = None,
@@ -250,8 +250,9 @@ class TaskRunner:
         Args:
             task_id: 任务 ID
             command: 要执行的命令
-            client_repo_url: Git 仓库 URL（用于确定仓库名称）
-            client_repo_ref: 分支或提交（测试模式下忽略）
+            workspace_name: 工作空间名称
+            client_repo_url: Git 仓库 URL
+            client_repo_ref: 分支或提交
             parameters: 命令参数（JSON 格式）
             environment: 环境变量
             timeout: 超时时间
@@ -261,10 +262,16 @@ class TaskRunner:
         Returns:
             ExecutionResult: 执行结果
         """
-        logger.info(f"Running task {task_id}: {command}")
+        logger.info(f"Running task {task_id} in workspace '{workspace_name}': {command}")
+        logger.info(f"[DEBUG] client_repo_url={client_repo_url}, client_repo_ref={client_repo_ref}")
+        logger.info(f"[DEBUG] working_dir={working_dir}")
         
-        # 确定执行目录 - 直接使用 repos 目录下的仓库
-        exec_dir = self.repos_dir
+        # 获取/创建工作空间目录
+        workspace_dir = self.workspaces_path / workspace_name
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 确定执行目录
+        exec_dir = workspace_dir
         
         if client_repo_url:
             # 从 URL 提取仓库名称
@@ -272,13 +279,31 @@ class TaskRunner:
             if repo_name.endswith('.git'):
                 repo_name = repo_name[:-4]
             
-            repo_path = self.repos_dir / repo_name
+            repo_path = workspace_dir / repo_name
             
-            if repo_path.exists():
-                logger.info(f"Using repo: {repo_path}")
-                exec_dir = repo_path
+            if not repo_path.exists():
+                # 自动 clone 仓库
+                logger.info(f"Cloning repository {client_repo_url} to {repo_path}")
+                try:
+                    clone_result = await self._clone_repo(client_repo_url, repo_path, client_repo_ref)
+                    if clone_result.exit_code != 0:
+                        return clone_result
+                except Exception as e:
+                    logger.error(f"Failed to clone repository: {e}")
+                    return ExecutionResult(
+                        exit_code=-1,
+                        stdout='',
+                        stderr=f"Failed to clone repository: {e}",
+                    )
             else:
-                logger.warning(f"Repo not found: {repo_path}, using repos_dir")
+                # 尝试 pull 最新代码
+                logger.info(f"Updating repository: {repo_path}")
+                try:
+                    await self._update_repo(repo_path, client_repo_ref)
+                except Exception as e:
+                    logger.warning(f"Failed to update repository (will continue anyway): {e}")
+            
+            exec_dir = repo_path
         
         # 如果指定了工作目录，切换到该目录
         if working_dir:
@@ -294,6 +319,7 @@ class TaskRunner:
         # 合并环境变量
         task_env = environment or {}
         task_env['TASKNEXUS_TASK_ID'] = str(task_id)
+        task_env['TASKNEXUS_WORKSPACE'] = workspace_name
         
         # 如果有参数，将其添加到环境变量
         if parameters:
@@ -317,3 +343,26 @@ class TaskRunner:
                 logger.error(f"stderr: {result.stderr[:500]}")
         
         return result
+    
+    async def _clone_repo(self, repo_url: str, target_path: Path, ref: str = "main") -> ExecutionResult:
+        """Clone a git repository"""
+        # Use just the directory name as target since we're setting working_dir to parent
+        repo_name = target_path.name
+        clone_cmd = f"git clone --depth 1 --branch {ref} {repo_url} {repo_name}"
+        logger.info(f"Cloning: {clone_cmd} (in {target_path.parent})")
+        return await self.executor.execute(
+            command=clone_cmd,
+            working_dir=target_path.parent,
+            timeout=300,  # 5 minutes for clone
+        )
+    
+    async def _update_repo(self, repo_path: Path, ref: str = "main") -> ExecutionResult:
+        """Update a git repository"""
+        # Fetch and reset to the latest
+        update_cmd = f"git fetch origin {ref} && git reset --hard origin/{ref}"
+        return await self.executor.execute(
+            command=update_cmd,
+            working_dir=repo_path,
+            timeout=120,  # 2 minutes for update
+        )
+

@@ -62,18 +62,18 @@ class Agent:
     
     def __init__(self, config: AgentConfig):
         self.config = config
-        self.task_runner = TaskRunner(config.workdir)
+        self.task_runner = TaskRunner(config.workspaces_path)
         self.client: Optional[AgentClient] = None
-        self.running_task = None  # Can be str (UUID) or int
+        self.running_tasks = {}  # workspace_name -> task_id
     
     async def start(self):
         """启动 Agent"""
         logger.info(f"Starting TaskNexus Agent: {self.config.name}")
         logger.info(f"Server: {self.config.server}")
-        logger.info(f"Work directory: {self.config.workdir}")
+        logger.info(f"Workspaces path: {self.config.workspaces_path}")
         
         # 确保工作目录存在
-        self.config.workdir.mkdir(parents=True, exist_ok=True)
+        self.config.workspaces_path.mkdir(parents=True, exist_ok=True)
         
         # 创建 WebSocket 客户端
         self.client = AgentClient(
@@ -103,6 +103,7 @@ class Agent:
     async def _handle_task_dispatch(self, message: dict):
         """处理任务分发"""
         task_id = message.get('task_id')
+        workspace_name = message.get('workspace_name', 'default')
         command = message.get('command', '')
         client_repo_url = message.get('client_repo_url', '')
         client_repo_ref = message.get('client_repo_ref', 'main')
@@ -111,17 +112,20 @@ class Agent:
         timeout = message.get('timeout', 3600)
         working_dir = message.get('working_dir', '')
         
-        logger.info(f"Received task {task_id}: {command}")
+        logger.info(f"Received task {task_id} for workspace '{workspace_name}': {command}")
+        logger.info(f"[DEBUG] Received message keys: {list(message.keys())}")
+        logger.info(f"[DEBUG] client_repo_url='{client_repo_url}', client_repo_ref='{client_repo_ref}'")
         
-        if self.running_task:
-            logger.warning(f"Already running task {self.running_task}, rejecting new task")
+        # 检查该 workspace 是否已有运行中的任务
+        if workspace_name in self.running_tasks:
+            logger.warning(f"Workspace '{workspace_name}' already running task {self.running_tasks[workspace_name]}, rejecting new task")
             await self.client.send_task_failed(
                 task_id, 
-                f"Agent is busy running task {self.running_task}"
+                f"Workspace '{workspace_name}' is busy running task {self.running_tasks[workspace_name]}"
             )
             return
         
-        self.running_task = task_id
+        self.running_tasks[workspace_name] = task_id
         
         try:
             # 通知任务开始
@@ -135,6 +139,7 @@ class Agent:
             result = await self.task_runner.run_task(
                 task_id=task_id,
                 command=command,
+                workspace_name=workspace_name,
                 client_repo_url=client_repo_url if client_repo_url else None,
                 client_repo_ref=client_repo_ref,
                 parameters=parameters,
@@ -173,7 +178,8 @@ class Agent:
             await self.client.send_task_failed(task_id, str(e))
         
         finally:
-            self.running_task = None
+            if workspace_name in self.running_tasks:
+                del self.running_tasks[workspace_name]
 
 
 @click.command()
@@ -182,16 +188,12 @@ class Agent:
     help='WebSocket 服务器地址 (例如: ws://localhost:8001/ws/agent/)'
 )
 @click.option(
-    '--token', '-t',
-    help='Agent 认证 Token'
-)
-@click.option(
     '--name', '-n',
     help='Agent 名称 (默认使用主机名)'
 )
 @click.option(
-    '--workdir', '-w',
-    help='工作目录 (默认: ./workdir)'
+    '--workspaces-path', '-w',
+    help='工作空间根目录 (默认: ./workspaces)'
 )
 @click.option(
     '--config', '-c', 'config_file',
@@ -212,9 +214,8 @@ class Agent:
 )
 def main(
     server: Optional[str],
-    token: Optional[str],
     name: Optional[str],
-    workdir: Optional[str],
+    workspaces_path: Optional[str],
     config_file: Optional[str],
     log_level: str,
     heartbeat_interval: int,
@@ -228,9 +229,8 @@ def main(
     config = load_config(
         config_file=config_file,
         server=server,
-        token=token,
         name=name,
-        workdir=workdir,
+        workspaces_path=workspaces_path,
         log_level=log_level,
         heartbeat_interval=heartbeat_interval,
     )
