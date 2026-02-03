@@ -223,6 +223,7 @@ class TaskRunner:
         client_repo_ref: str = "main",
         timeout: int = 3600,
         on_output: Optional[callable] = None,
+        environment: Optional[Dict[str, str]] = None,
     ) -> ExecutionResult:
         """
         运行任务
@@ -235,6 +236,7 @@ class TaskRunner:
             client_repo_ref: 分支或提交
             timeout: 超时时间
             on_output: 输出回调
+            environment: 自定义环境变量
         
         Returns:
             ExecutionResult: 执行结果
@@ -286,6 +288,9 @@ class TaskRunner:
             'TASKNEXUS_TASK_ID': str(task_id),
             'TASKNEXUS_WORKSPACE': workspace_name,
         }
+        # 合并用户自定义环境变量
+        if environment:
+            task_env.update(environment)
         
         # 执行命令
         result = await self.executor.execute(

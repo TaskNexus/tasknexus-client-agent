@@ -108,6 +108,7 @@ class Agent:
         client_repo_url = message.get('client_repo_url', '')
         client_repo_ref = message.get('client_repo_ref', 'main')
         timeout = message.get('timeout', 3600)
+        environment = message.get('environment', {})
         
         logger.info(f"Received task {task_id} for workspace '{workspace_name}': {command}")
         logger.info(f"[DEBUG] Received message keys: {list(message.keys())}")
@@ -141,6 +142,7 @@ class Agent:
                 client_repo_ref=client_repo_ref,
                 timeout=timeout,
                 on_output=on_output,
+                environment=environment if environment else None,
             )
             
             # 发送结果
