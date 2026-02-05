@@ -23,7 +23,7 @@ jobs:
           - os: windows-latest
             platform: windows
             artifact_name: tasknexus-agent.exe
-            asset_name: tasknexus-agent-windows-amd64.exe
+            asset_name: tasknexus-agent-windows-x86_64.exe
           - os: ubuntu-latest
             platform: linux
             artifact_name: tasknexus-agent
