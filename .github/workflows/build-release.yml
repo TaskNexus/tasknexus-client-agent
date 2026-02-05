@@ -58,7 +58,7 @@ jobs:
 
       - name: Build executable with Nuitka
         run: |
-          python -m nuitka --standalone --onefile --output-dir=dist --output-filename=${{ matrix.artifact_name }} --follow-imports --include-package=agent run_agent.py
+          python -m nuitka --standalone --onefile --assume-yes-for-downloads --output-dir=dist --output-filename=${{ matrix.artifact_name }} --include-package=agent run_agent.py
         shell: bash
 
       - name: Verify build
