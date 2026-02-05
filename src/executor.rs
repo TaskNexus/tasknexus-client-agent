@@ -97,8 +97,8 @@ impl CommandExecutor {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
+        let mut stdout_reader = BufReader::new(stdout);
+        let mut stderr_reader = BufReader::new(stderr);
 
         let stdout_chunks: Vec<String> = Vec::new();
         let _stderr_chunks: Vec<String> = Vec::new();
@@ -111,9 +111,16 @@ impl CommandExecutor {
         // 读取 stdout
         let stdout_handle = tokio::spawn(async move {
             let mut lines = Vec::new();
-            while let Ok(Some(line)) = stdout_reader.next_line().await {
-                let _ = tx_stdout.send((line.clone(), false)).await;
-                lines.push(line);
+            let mut buffer = Vec::new();
+            while let Ok(n) = stdout_reader.read_until(b'\n', &mut buffer).await {
+                if n == 0 {
+                    break;
+                }
+                let line_str = String::from_utf8_lossy(&buffer).trim_end().to_string();
+                let params = (line_str.clone(), false);
+                let _ = tx_stdout.send(params).await;
+                lines.push(line_str);
+                buffer.clear();
             }
             lines
         });
@@ -121,9 +128,16 @@ impl CommandExecutor {
         // 读取 stderr
         let stderr_handle = tokio::spawn(async move {
             let mut lines = Vec::new();
-            while let Ok(Some(line)) = stderr_reader.next_line().await {
-                let _ = tx_stderr.send((line.clone(), true)).await;
-                lines.push(line);
+            let mut buffer = Vec::new();
+            while let Ok(n) = stderr_reader.read_until(b'\n', &mut buffer).await {
+                if n == 0 {
+                    break;
+                }
+                let line_str = String::from_utf8_lossy(&buffer).trim_end().to_string();
+                let params = (line_str.clone(), true);
+                let _ = tx_stderr.send(params).await;
+                lines.push(line_str);
+                buffer.clear();
             }
             lines
         });
