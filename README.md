@@ -97,6 +97,62 @@ pytest
 black agent/
 ```
 
+## 构建可执行文件
+
+将 Agent 打包为独立可执行文件，无需 Python 运行环境。
+
+### 本地构建
+
+```bash
+# 安装构建依赖
+pip install -e ".[build]"
+
+# 使用构建脚本
+python build.py
+
+# 或直接使用 PyInstaller
+pyinstaller tasknexus-agent.spec
+```
+
+构建产物位于 `dist/` 目录：
+- Windows: `tasknexus-agent.exe`
+- Linux/macOS: `tasknexus-agent`
+
+### 自动化构建 (GitHub Actions)
+
+推送 tag 时自动构建并发布：
+
+```bash
+# 创建并推送版本 tag，触发自动构建
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+GitHub Actions 会自动构建三个平台的可执行文件并创建 Release。
+
+### 下载预编译版本
+
+从 [Releases](../../releases) 页面下载对应平台的可执行文件：
+
+| 平台        | 文件名                              |
+| ----------- | ----------------------------------- |
+| Windows x64 | `tasknexus-agent-windows-amd64.exe` |
+| Linux x64   | `tasknexus-agent-linux-amd64`       |
+| macOS ARM64 | `tasknexus-agent-macos-arm64`       |
+
+### 使用可执行文件
+
+```bash
+# 查看帮助
+./tasknexus-agent --help
+
+# 使用配置文件启动
+./tasknexus-agent --config config.yaml
+
+# 直接指定参数启动
+./tasknexus-agent --server ws://your-server:8001/ws/agent/ --name my-agent
+```
+
 ## 许可证
 
 MIT License
