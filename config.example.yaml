@@ -23,3 +23,8 @@ max_reconnect_attempts: -1   # -1 表示无限重试
 
 # 默认任务超时（秒）
 task_timeout: 3600
+
+# 开机自启动配置
+autostart:
+  enabled: false  # 是否启用开机自启动
+  args: []        # 启动时的额外命令行参数，例如: ["--log-level", "DEBUG"]

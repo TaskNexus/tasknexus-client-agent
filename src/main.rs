@@ -14,6 +14,7 @@ use tasknexus_agent::{
     config::{load_config, AgentConfig},
     client::{AgentClient, TaskDispatchData},
     executor::TaskRunner,
+    autostart::AutoStartManager,
 };
 
 /// TaskNexus Agent - 客户端代理
@@ -22,29 +23,9 @@ use tasknexus_agent::{
 #[command(about = "TaskNexus Agent - 连接到 TaskNexus 服务器执行远程任务")]
 #[command(version)]
 struct Cli {
-    /// WebSocket 服务器地址 (例如: ws://localhost:8001/ws/agent/)
+    /// 配置文件路径 (必须)
     #[arg(short, long)]
-    server: Option<String>,
-
-    /// Agent 名称 (默认使用主机名)
-    #[arg(short, long)]
-    name: Option<String>,
-
-    /// 工作空间根目录 (默认: ./workspaces)
-    #[arg(short = 'w', long)]
-    workspaces_path: Option<PathBuf>,
-
-    /// 配置文件路径
-    #[arg(short, long)]
-    config: Option<PathBuf>,
-
-    /// 日志级别
-    #[arg(short, long, default_value = "INFO")]
-    log_level: String,
-
-    /// 心跳间隔(秒)
-    #[arg(long, default_value = "30")]
-    heartbeat: Option<u64>,
+    config: PathBuf,
 }
 
 /// 配置日志
@@ -232,14 +213,8 @@ async fn main() {
     let cli = Cli::parse();
 
     // 加载配置
-    let config = match load_config(
-        cli.config,
-        cli.server,
-        cli.name,
-        cli.workspaces_path,
-        Some(cli.log_level.clone()),
-        cli.heartbeat,
-    ) {
+    let config_path = cli.config.clone();
+    let config = match load_config(cli.config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("配置加载失败: {}", e);
@@ -258,11 +233,49 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // 根据配置自动应用开机自启动设置
+    apply_autostart_from_config(&config, &config_path);
+
     // 创建并运行 Agent
     let agent = Agent::new(config);
 
     if let Err(e) = agent.start().await {
         error!("Agent 运行失败: {}", e);
         std::process::exit(1);
+    }
+}
+
+
+/// 根据配置自动应用开机自启动设置
+fn apply_autostart_from_config(config: &AgentConfig, config_path: &PathBuf) {
+    let extra_args = if config.autostart.args.is_empty() {
+        None
+    } else {
+        Some(config.autostart.args.as_slice())
+    };
+
+    let manager = match AutoStartManager::new("tasknexus-agent", Some(config_path), extra_args) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("创建自启动管理器失败: {}", e);
+            return;
+        }
+    };
+
+    // 检查当前状态是否与配置一致
+    let current_enabled = manager.is_enabled().unwrap_or(false);
+    
+    if config.autostart.enabled && !current_enabled {
+        // 配置要求启用，但当前未启用
+        match manager.enable() {
+            Ok(_) => info!("根据配置启用了开机自启动"),
+            Err(e) => warn!("启用开机自启动失败: {}", e),
+        }
+    } else if !config.autostart.enabled && current_enabled {
+        // 配置要求禁用，但当前已启用
+        match manager.disable() {
+            Ok(_) => info!("根据配置禁用了开机自启动"),
+            Err(e) => warn!("禁用开机自启动失败: {}", e),
+        }
     }
 }

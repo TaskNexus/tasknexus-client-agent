@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod executor;
+pub mod autostart;
 
 pub use client::AgentClient;
 pub use config::AgentConfig;

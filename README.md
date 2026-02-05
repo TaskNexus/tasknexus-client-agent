@@ -9,6 +9,7 @@ TaskNexus 客户端代理，用于连接 TaskNexus 服务器并执行远程任�
 - ❤️ **心跳检测** - 定期发送心跳保持连接
 - 📁 **Git 支持** - 自动 clone/pull 项目仓库
 - 🖥️ **跨平台** - 支持 Windows, Linux, macOS
+- 🚀 **开机自启动** - 支持开机自动启动 Agent
 
 ## 安装
 
@@ -25,18 +26,10 @@ cargo build --release
 
 ## 使用方法
 
-### 命令行参数
+### 启动 Agent
 
 ```bash
-tasknexus-agent [OPTIONS]
-
-Options:
-  -s, --server <URL>           WebSocket 服务器地址
-  -n, --name <NAME>            Agent 名称 (默认使用主机名)
-  -w, --workspaces-path <DIR>  工作空间根目录 (默认: ./workspaces)
-  -c, --config <FILE>          配置文件路径
-  -l, --log-level <LEVEL>      日志级别 [default: INFO]
-      --heartbeat <SECS>       心跳间隔秒数 [default: 30]
+tasknexus-agent --config config.yaml
 ```
 
 ### 配置文件
@@ -44,21 +37,40 @@ Options:
 复制 `config.example.yaml` 并根据需要修改：
 
 ```yaml
+# 服务器配置
 server: ws://localhost:8001/ws/agent/
 name: My-Agent
 workspaces_path: ./workspaces
+
+# 日志配置
 log_level: INFO
+
+# 连接配置
 heartbeat_interval: 30
+reconnect_interval: 5
+
+# 开机自启动
+autostart:
+  enabled: true
+  args: []
 ```
 
-### 环境变量
+所有配置均通过配置文件管理，不支持命令行参数覆盖。
 
-- `TASKNEXUS_SERVER` - WebSocket 服务器地址
-- `TASKNEXUS_AGENT_NAME` - Agent 名称
-- `TASKNEXUS_WORKSPACES_PATH` - 工作空间路径
-- `TASKNEXUS_LOG_LEVEL` - 日志级别
+### 开机自启动
 
-配置优先级: 命令行参数 > 环境变量 > 配置文件 > 默认值
+Agent 运行时会根据配置文件自动应用开机自启动设置：
+
+```yaml
+autostart:
+  enabled: true  # 是否启用开机自启动
+  args: []       # 启动时的额外参数
+```
+
+**平台说明:**
+- **Windows**: 添加到注册表 `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
+- **Linux**: 创建 XDG Autostart `.desktop` 文件
+- **macOS**: 创建 Launch Agent `.plist` 文件
 
 ## 开发
 

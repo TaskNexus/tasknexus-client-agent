@@ -38,6 +38,20 @@ pub struct AgentConfig {
 
     /// 默认任务超时(秒)
     pub task_timeout: u64,
+
+    /// 开机自启动配置
+    pub autostart: AutostartConfig,
+}
+
+/// 开机自启动配置
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AutostartConfig {
+    /// 是否启用开机自启动
+    pub enabled: bool,
+
+    /// 启动时的额外参数
+    pub args: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -54,6 +68,7 @@ impl Default for AgentConfig {
             reconnect_interval: 5,
             max_reconnect_attempts: -1,
             task_timeout: 3600,
+            autostart: AutostartConfig::default(),
         }
     }
 }
@@ -137,32 +152,6 @@ impl AgentConfig {
     pub fn get_workspace_path(&self, workspace_name: &str) -> PathBuf {
         self.workspaces_path.join(workspace_name)
     }
-
-    /// 合并命令行参数
-    pub fn merge_cli(
-        &mut self,
-        server: Option<String>,
-        name: Option<String>,
-        workspaces_path: Option<PathBuf>,
-        log_level: Option<String>,
-        heartbeat_interval: Option<u64>,
-    ) {
-        if let Some(s) = server {
-            self.server = s;
-        }
-        if let Some(n) = name {
-            self.name = n;
-        }
-        if let Some(p) = workspaces_path {
-            self.workspaces_path = p;
-        }
-        if let Some(l) = log_level {
-            self.log_level = l;
-        }
-        if let Some(h) = heartbeat_interval {
-            self.heartbeat_interval = h;
-        }
-    }
 }
 
 /// 系统信息
@@ -188,55 +177,15 @@ fn get_local_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-/// 加载配置，优先级：命令行参数 > 配置文件 > 环境变量 > 默认值
-pub fn load_config(
-    config_file: Option<PathBuf>,
-    server: Option<String>,
-    name: Option<String>,
-    workspaces_path: Option<PathBuf>,
-    log_level: Option<String>,
-    heartbeat_interval: Option<u64>,
-) -> Result<AgentConfig> {
-    // 从环境变量开始
-    let mut config = AgentConfig::from_env();
-
-    // 如果有配置文件，加载并覆盖
-    if let Some(ref path) = config_file {
-        if path.exists() {
-            let file_config = AgentConfig::from_file(path)?;
-            // 只覆盖非默认值
-            if !file_config.server.is_empty() {
-                config.server = file_config.server;
-            }
-            if file_config.name != AgentConfig::default().name {
-                config.name = file_config.name;
-            }
-            if file_config.workspaces_path != PathBuf::from("./workspaces") {
-                config.workspaces_path = file_config.workspaces_path;
-            }
-            if file_config.log_level != "INFO" {
-                config.log_level = file_config.log_level;
-            }
-            if file_config.log_file.is_some() {
-                config.log_file = file_config.log_file;
-            }
-            if file_config.heartbeat_interval != 30 {
-                config.heartbeat_interval = file_config.heartbeat_interval;
-            }
-            if file_config.reconnect_interval != 5 {
-                config.reconnect_interval = file_config.reconnect_interval;
-            }
-            if file_config.max_reconnect_attempts != -1 {
-                config.max_reconnect_attempts = file_config.max_reconnect_attempts;
-            }
-            if file_config.task_timeout != 3600 {
-                config.task_timeout = file_config.task_timeout;
-            }
-        }
+/// 从配置文件加载配置
+pub fn load_config(config_file: PathBuf) -> Result<AgentConfig> {
+    if !config_file.exists() {
+        return Err(crate::error::AgentError::Config(format!(
+            "配置文件不存在: {:?}",
+            config_file
+        )));
     }
 
-    // 命令行参数覆盖
-    config.merge_cli(server, name, workspaces_path, log_level, heartbeat_interval);
-
+    let config = AgentConfig::from_file(&config_file)?;
     Ok(config)
 }
