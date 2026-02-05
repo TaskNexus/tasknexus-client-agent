@@ -9,6 +9,16 @@ TaskNexus Agent 入口点脚本
 import sys
 import os
 
+# 修复 Windows 控制台编码问题
+if sys.platform == 'win32':
+    # 设置 stdout/stderr 为 UTF-8 编码
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    # 设置环境变量
+    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+
 # 确保 agent 包可以被正确导入
 if getattr(sys, 'frozen', False):
     # 如果是 PyInstaller 打包的可执行文件
