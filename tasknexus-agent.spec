@@ -14,14 +14,18 @@ from pathlib import Path
 # Get the base directory
 base_dir = Path(SPECPATH)
 
-# Analysis configuration
+block_cipher = None
+
+# Analysis configuration - use run_agent.py as entry point
 a = Analysis(
-    [str(base_dir / 'agent' / 'main.py')],
+    [str(base_dir / 'run_agent.py')],
     pathex=[str(base_dir)],
     binaries=[],
     datas=[
         # Include example config file
         (str(base_dir / 'config.example.yaml'), '.'),
+        # Include agent package as data to ensure proper import
+        (str(base_dir / 'agent'), 'agent'),
     ],
     hiddenimports=[
         # Ensure all agent modules are included
@@ -36,6 +40,9 @@ a = Analysis(
         'websockets.legacy',
         'websockets.legacy.client',
         'git',
+        'git.cmd',
+        'git.repo',
+        'git.remote',
         'click',
         'yaml',
         'aiofiles',
@@ -58,12 +65,12 @@ a = Analysis(
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
-    cipher=None,
+    cipher=block_cipher,
     noarchive=False,
 )
 
 # Create PYZ archive
-pyz = PYZ(a.pure, a.zipped_data, cipher=None)
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 # Create the executable
 exe = EXE(

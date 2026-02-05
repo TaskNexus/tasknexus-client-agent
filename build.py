@@ -63,15 +63,19 @@ def build_executable(onedir=False):
     
     if onedir:
         # 目录模式 - 适合调试
+        data_sep = ';' if platform.system() == 'Windows' else ':'
         cmd = [
             sys.executable, '-m', 'PyInstaller',
             '--name', 'tasknexus-agent',
             '--onedir',
             '--console',
-            '--add-data', 'config.example.yaml:.' if platform.system() != 'Windows' else 'config.example.yaml;.',
+            f'--add-data=config.example.yaml{data_sep}.',
+            f'--add-data=agent{data_sep}agent',
             '--hidden-import', 'websockets.legacy.client',
             '--hidden-import', 'asyncio.selector_events',
-            'agent/main.py'
+            '--hidden-import', 'git.cmd',
+            '--hidden-import', 'git.repo',
+            'run_agent.py'
         ]
     else:
         # 使用 spec 文件构建单文件
