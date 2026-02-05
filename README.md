@@ -1,158 +1,75 @@
-# TaskNexus Agent
+# TaskNexus Agent (Rust)
 
-TaskNexus 客户端代理应用程序，用于连接 TaskNexus 服务器并执行远程任务。
+TaskNexus 客户端代理，用于连接 TaskNexus 服务器并执行远程任务。
 
-## 功能特性
+## 特性
 
-- 🔌 **WebSocket 连接** - 与服务器保持实时双向通信
-- 💓 **心跳机制** - 自动维持连接状态
-- 📦 **Git 仓库管理** - 自动拉取和更新任务脚本仓库  
-- ⚡ **命令执行** - 在本地环境执行服务器分发的任务
-- 📊 **结果上报** - 实时上报任务执行状态和结果
+- 🚀 **高性能** - 使用 Rust 编写，二进制文件仅 ~2.5 MB
+- 🔄 **自动重连** - 断线时自动尝试重新连接
+- ❤️ **心跳检测** - 定期发送心跳保持连接
+- 📁 **Git 支持** - 自动 clone/pull 项目仓库
+- 🖥️ **跨平台** - 支持 Windows, Linux, macOS
 
 ## 安装
 
-### 从源码安装
+### 从 Release 下载
+
+前往 [Releases](https://github.com/yourorg/TaskNexus/releases) 下载对应平台的二进制文件。
+
+### 从源码编译
 
 ```bash
-cd tasknexus-client-agent
-pip install -e .
-```
-
-### 使用 pip 安装
-
-```bash
-pip install tasknexus-client-agent
+# 需要 Rust 1.70+
+cargo build --release
 ```
 
 ## 使用方法
 
-### 命令行启动
+### 命令行参数
 
 ```bash
-# 基本启动
-tasknexus-client-agent --server ws://localhost:8001/ws/agent/ --token YOUR_TOKEN
+tasknexus-agent [OPTIONS]
 
-# 完整参数
-tasknexus-client-agent \
-    --server ws://your-server:8001/ws/agent/ \
-    --token YOUR_AGENT_TOKEN \
-    --name my-agent \
-    --workdir /path/to/workdir \
-    --log-level INFO
+Options:
+  -s, --server <URL>           WebSocket 服务器地址
+  -n, --name <NAME>            Agent 名称 (默认使用主机名)
+  -w, --workspaces-path <DIR>  工作空间根目录 (默认: ./workspaces)
+  -c, --config <FILE>          配置文件路径
+  -l, --log-level <LEVEL>      日志级别 [default: INFO]
+      --heartbeat <SECS>       心跳间隔秒数 [default: 30]
 ```
 
-### 使用配置文件
+### 配置文件
 
-创建 `config.yaml`:
+复制 `config.example.yaml` 并根据需要修改：
 
 ```yaml
 server: ws://localhost:8001/ws/agent/
-token: YOUR_AGENT_TOKEN
-name: my-agent
-workdir: ./workdir
+name: My-Agent
+workspaces_path: ./workspaces
 log_level: INFO
 heartbeat_interval: 30
 ```
 
-然后启动:
+### 环境变量
 
-```bash
-tasknexus-client-agent --config config.yaml
-```
+- `TASKNEXUS_SERVER` - WebSocket 服务器地址
+- `TASKNEXUS_AGENT_NAME` - Agent 名称
+- `TASKNEXUS_WORKSPACES_PATH` - 工作空间路径
+- `TASKNEXUS_LOG_LEVEL` - 日志级别
 
-## 配置选项
-
-| 参数          | 环境变量               | 默认值      | 描述                 |
-| ------------- | ---------------------- | ----------- | -------------------- |
-| `--server`    | `TASKNEXUS_SERVER`     | -           | WebSocket 服务器地址 |
-| `--token`     | `TASKNEXUS_TOKEN`      | -           | Agent 认证 Token     |
-| `--name`      | `TASKNEXUS_AGENT_NAME` | hostname    | Agent 名称           |
-| `--workdir`   | `TASKNEXUS_WORKDIR`    | `./workdir` | 工作目录             |
-| `--log-level` | `TASKNEXUS_LOG_LEVEL`  | `INFO`      | 日志级别             |
-| `--heartbeat` | -                      | `30`        | 心跳间隔(秒)         |
-
-## 工作原理
-
-1. **连接** - Agent 使用 Token 连接到 TaskNexus WebSocket 服务
-2. **注册** - 发送系统信息，服务器记录 Agent 状态为在线
-3. **心跳** - 定期发送心跳消息保持连接
-4. **任务接收** - 接收服务器分发的任务
-5. **脚本拉取** - 根据任务配置，克隆或更新 Git 仓库
-6. **命令执行** - 在指定目录执行命令
-7. **结果上报** - 将执行结果发送回服务器
+配置优先级: 命令行参数 > 环境变量 > 配置文件 > 默认值
 
 ## 开发
 
-### 运行测试
-
 ```bash
-pip install -e ".[dev]"
-pytest
+# 运行测试
+cargo test
+
+# 开发模式运行
+cargo run -- -s ws://localhost:8001/ws/agent/ -n dev-agent
 ```
 
-### 代码格式化
+## License
 
-```bash
-black agent/
-```
-
-## 构建可执行文件
-
-将 Agent 打包为独立可执行文件，无需 Python 运行环境。
-
-### 本地构建
-
-```bash
-# 安装构建依赖
-pip install -e ".[build]"
-
-# 使用构建脚本
-python build.py
-
-# 或直接使用 PyInstaller
-pyinstaller tasknexus-agent.spec
-```
-
-构建产物位于 `dist/` 目录：
-- Windows: `tasknexus-agent.exe`
-- Linux/macOS: `tasknexus-agent`
-
-### 自动化构建 (GitHub Actions)
-
-推送 tag 时自动构建并发布：
-
-```bash
-# 创建并推送版本 tag，触发自动构建
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-GitHub Actions 会自动构建三个平台的可执行文件并创建 Release。
-
-### 下载预编译版本
-
-从 [Releases](../../releases) 页面下载对应平台的可执行文件：
-
-| 平台        | 文件名                              |
-| ----------- | ----------------------------------- |
-| Windows x64 | `tasknexus-agent-windows-amd64.exe` |
-| Linux x64   | `tasknexus-agent-linux-amd64`       |
-| macOS ARM64 | `tasknexus-agent-macos-arm64`       |
-
-### 使用可执行文件
-
-```bash
-# 查看帮助
-./tasknexus-agent --help
-
-# 使用配置文件启动
-./tasknexus-agent --config config.yaml
-
-# 直接指定参数启动
-./tasknexus-agent --server ws://your-server:8001/ws/agent/ --name my-agent
-```
-
-## 许可证
-
-MIT License
+MIT

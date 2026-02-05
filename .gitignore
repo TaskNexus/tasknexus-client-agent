@@ -47,3 +47,4 @@ config.yml
 .DS_Store
 Thumbs.db
 workspaces/**
+target
