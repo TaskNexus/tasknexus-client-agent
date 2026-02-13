@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -18,6 +18,7 @@ pub struct ExecutionResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    pub cancelled: bool,
 }
 
 /// 命令执行器
@@ -38,6 +39,7 @@ impl CommandExecutor {
         environment: Option<&HashMap<String, String>>,
         timeout_secs: Option<u64>,
         on_output: Option<F>,
+        cancel_rx: Option<watch::Receiver<bool>>,
     ) -> ExecutionResult
     where
         F: Fn(String, bool) -> Fut + Send + 'static,
@@ -90,6 +92,7 @@ impl CommandExecutor {
                     stdout: String::new(),
                     stderr: e.to_string(),
                     timed_out: false,
+                    cancelled: false,
                 };
             }
         };
@@ -154,40 +157,85 @@ impl CommandExecutor {
             }
         });
 
-        // 等待命令完成，带超时
-        let result = timeout(Duration::from_secs(timeout_secs), async {
+        // Wait for completion with timeout and cancellation
+        let timed_future = timeout(Duration::from_secs(timeout_secs), async {
             let stdout_lines = stdout_handle.await.unwrap_or_default();
             let stderr_lines = stderr_handle.await.unwrap_or_default();
             let status = child.wait().await;
             (stdout_lines, stderr_lines, status)
-        })
-        .await;
+        });
 
-        // 确保回调处理完成
-        drop(callback_handle);
-
-        match result {
-            Ok((stdout_lines, stderr_lines, status)) => {
-                let exit_code = status
-                    .map(|s| s.code().unwrap_or(-1))
-                    .unwrap_or(-1);
-
-                ExecutionResult {
-                    exit_code,
-                    stdout: stdout_lines.join("\n"),
-                    stderr: stderr_lines.join("\n"),
-                    timed_out: false,
+        // If we have a cancel receiver, `select!` between timeout and cancellation
+        if let Some(mut cancel_rx) = cancel_rx {
+            tokio::select! {
+                result = timed_future => {
+                    drop(callback_handle);
+                    match result {
+                        Ok((stdout_lines, stderr_lines, status)) => {
+                            let exit_code = status
+                                .map(|s| s.code().unwrap_or(-1))
+                                .unwrap_or(-1);
+                            ExecutionResult {
+                                exit_code,
+                                stdout: stdout_lines.join("\n"),
+                                stderr: stderr_lines.join("\n"),
+                                timed_out: false,
+                                cancelled: false,
+                            }
+                        }
+                        Err(_) => {
+                            warn!("Command timed out after {} seconds", timeout_secs);
+                            let _ = child.kill().await;
+                            ExecutionResult {
+                                exit_code: -1,
+                                stdout: stdout_chunks.join("\n"),
+                                stderr: format!("Command timed out after {} seconds", timeout_secs),
+                                timed_out: true,
+                                cancelled: false,
+                            }
+                        }
+                    }
+                }
+                _ = cancel_rx.changed() => {
+                    warn!("Command cancelled");
+                    let _ = child.kill().await;
+                    drop(callback_handle);
+                    ExecutionResult {
+                        exit_code: -1,
+                        stdout: stdout_chunks.join("\n"),
+                        stderr: "Task was cancelled".to_string(),
+                        timed_out: false,
+                        cancelled: true,
+                    }
                 }
             }
-            Err(_) => {
-                warn!("Command timed out after {} seconds", timeout_secs);
-                let _ = child.kill().await;
-
-                ExecutionResult {
-                    exit_code: -1,
-                    stdout: stdout_chunks.join("\n"),
-                    stderr: format!("Command timed out after {} seconds", timeout_secs),
-                    timed_out: true,
+        } else {
+            // No cancellation - original behavior
+            let result = timed_future.await;
+            drop(callback_handle);
+            match result {
+                Ok((stdout_lines, stderr_lines, status)) => {
+                    let exit_code = status
+                        .map(|s| s.code().unwrap_or(-1))
+                        .unwrap_or(-1);
+                    ExecutionResult {
+                        exit_code,
+                        stdout: stdout_lines.join("\n"),
+                        stderr: stderr_lines.join("\n"),
+                        timed_out: false,
+                        cancelled: false,
+                    }
+                }
+                Err(_) => {
+                    warn!("Command timed out after {} seconds", timeout_secs);
+                    let _ = child.kill().await;
+                    ExecutionResult {
+                        exit_code: -1,
+                        stdout: stdout_chunks.join("\n"),
+                        stderr: format!("Command timed out after {} seconds", timeout_secs),
+                        timed_out: true,
+                        cancelled: false,
+                    }
                 }
             }
         }
@@ -222,6 +270,7 @@ impl TaskRunner {
         timeout_secs: u64,
         on_output: Option<F>,
         environment: Option<HashMap<String, String>>,
+        cancel_rx: Option<watch::Receiver<bool>>,
     ) -> ExecutionResult
     where
         F: Fn(String, bool) -> Fut + Send + Clone + 'static,
@@ -245,6 +294,7 @@ impl TaskRunner {
                 stdout: String::new(),
                 stderr: format!("Failed to create workspace directory: {}", e),
                 timed_out: false,
+                cancelled: false,
             };
         }
 
@@ -302,6 +352,7 @@ impl TaskRunner {
                 Some(&task_env),
                 Some(timeout_secs),
                 on_output,
+                cancel_rx,
             )
             .await;
 
@@ -341,6 +392,7 @@ impl TaskRunner {
                 None,
                 Some(300), // 5 minutes for clone
                 None,
+                None,
             )
             .await
     }
@@ -358,6 +410,7 @@ impl TaskRunner {
                 Some(repo_path),
                 None,
                 Some(120), // 2 minutes for update
+                None,
                 None,
             )
             .await

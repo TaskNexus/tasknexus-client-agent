@@ -6,7 +6,8 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
+use tokio::time::{interval, Duration};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -71,7 +72,8 @@ struct Agent {
     config: AgentConfig,
     task_runner: TaskRunner,
     client: AgentClient,
-    running_tasks: Arc<RwLock<HashMap<String, i64>>>,
+    /// Maps workspace_name -> (task_id, cancel_sender)
+    running_tasks: Arc<RwLock<HashMap<String, (i64, watch::Sender<bool>)>>>,
 }
 
 impl Agent {
@@ -97,6 +99,7 @@ impl Agent {
 
         let agent = Arc::new(self);
         let agent_clone = agent.clone();
+        let agent_cancel = agent.clone();
 
         // 运行客户端
         agent.client.run(
@@ -104,6 +107,12 @@ impl Agent {
                 let agent = agent_clone.clone();
                 async move {
                     agent.handle_task_dispatch(data).await;
+                }
+            },
+            move |task_id| {
+                let agent = agent_cancel.clone();
+                async move {
+                    agent.handle_task_cancel(task_id).await;
                 }
             },
             || info!("Connected to TaskNexus server"),
@@ -126,7 +135,7 @@ impl Agent {
         // 检查该 workspace 是否已有运行中的任务
         {
             let running = self.running_tasks.read().await;
-            if let Some(existing_task_id) = running.get(&workspace_name) {
+            if let Some((existing_task_id, _)) = running.get(&workspace_name) {
                 warn!(
                     "Workspace '{}' already running task {}, rejecting new task",
                     workspace_name, existing_task_id
@@ -142,13 +151,35 @@ impl Agent {
             }
         }
 
+        // 创建取消信号通道
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
         // 标记任务正在运行
-        self.running_tasks.write().await.insert(workspace_name.clone(), task_id);
+        self.running_tasks.write().await.insert(workspace_name.clone(), (task_id, cancel_tx));
 
         // 通知任务开始
         if let Err(e) = self.client.send_task_started(task_id).await {
             error!("Failed to send task started: {}", e);
         }
+
+        // 启动任务心跳发送器
+        let heartbeat_client = self.client.clone();
+        let mut heartbeat_cancel_rx = cancel_rx.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = heartbeat_client.send_task_heartbeat(task_id).await {
+                            warn!("Failed to send task heartbeat: {}", e);
+                        }
+                    }
+                    _ = heartbeat_cancel_rx.changed() => {
+                        break;
+                    }
+                }
+            }
+        });
 
         // 创建输出回调
         let client = self.client.clone();
@@ -159,7 +190,7 @@ impl Agent {
             }
         };
 
-        // 执行任务
+        // 执行任务，传入取消信号
         let result = self.task_runner.run_task(
             task_id,
             &data.command,
@@ -169,10 +200,17 @@ impl Agent {
             data.timeout,
             Some(output_callback),
             if data.environment.is_empty() { None } else { Some(data.environment) },
+            Some(cancel_rx),
         ).await;
 
+        // 停止心跳发送器
+        heartbeat_task.abort();
+
         // 发送结果
-        if result.exit_code == 0 {
+        if result.cancelled {
+            info!("Task {} was cancelled", task_id);
+            // Task already marked as cancelled on the server side
+        } else if result.exit_code == 0 {
             if let Err(e) = self.client.send_task_completed(
                 task_id,
                 result.exit_code,
@@ -205,6 +243,19 @@ impl Agent {
 
         // 移除运行中的任务
         self.running_tasks.write().await.remove(&workspace_name);
+    }
+
+    async fn handle_task_cancel(&self, task_id: i64) {
+        info!("Processing cancel for task {}", task_id);
+        let running = self.running_tasks.read().await;
+        for (workspace_name, (tid, cancel_tx)) in running.iter() {
+            if *tid == task_id {
+                info!("Sending cancel signal to task {} in workspace '{}'", task_id, workspace_name);
+                let _ = cancel_tx.send(true);
+                return;
+            }
+        }
+        warn!("Task {} not found in running tasks, cannot cancel", task_id);
     }
 }
 

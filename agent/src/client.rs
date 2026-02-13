@@ -39,6 +39,9 @@ pub enum ServerMessage {
         #[serde(default)]
         environment: HashMap<String, String>,
     },
+    TaskCancel {
+        task_id: i64,
+    },
 }
 
 fn default_ref() -> String {
@@ -58,6 +61,7 @@ pub enum ClientMessage {
     TaskProgress { task_id: i64, output: String },
     TaskCompleted { task_id: i64, exit_code: i32, stdout: String, stderr: String },
     TaskFailed { task_id: i64, error: String },
+    TaskHeartbeat { task_id: i64 },
 }
 
 /// 任务分发的数据
@@ -150,16 +154,24 @@ impl AgentClient {
         self.send_message(ClientMessage::TaskFailed { task_id, error }).await
     }
 
+    /// 发送任务心跳
+    pub async fn send_task_heartbeat(&self, task_id: i64) -> Result<()> {
+        self.send_message(ClientMessage::TaskHeartbeat { task_id }).await
+    }
+
     /// 运行客户端主循环
-    pub async fn run<F, Fut>(
+    pub async fn run<F, G, Fut1, Fut2>(
         &self,
         on_task_dispatch: F,
+        on_task_cancel: G,
         on_connected: impl Fn() + Send + Sync + 'static,
         on_disconnected: impl Fn() + Send + Sync + 'static,
     ) -> Result<()>
     where
-        F: Fn(TaskDispatchData) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + Clone + 'static,
+        Fut1: std::future::Future<Output = ()> + Send,
+        G: Fn(i64) -> Fut2 + Send + Sync + Clone + 'static,
+        Fut2: std::future::Future<Output = ()> + Send,
     {
         *self.running.write().await = true;
 
@@ -195,7 +207,7 @@ impl AgentClient {
             }
 
             // 运行消息循环
-            if let Err(e) = self.message_loop(on_task_dispatch.clone()).await {
+            if let Err(e) = self.message_loop(on_task_dispatch.clone(), on_task_cancel.clone()).await {
                 error!("Message loop error: {}", e);
             }
 
@@ -245,10 +257,12 @@ impl AgentClient {
     }
 
     /// 消息接收循环
-    async fn message_loop<F, Fut>(&self, on_task_dispatch: F) -> Result<()>
+    async fn message_loop<F, G, Fut1, Fut2>(&self, on_task_dispatch: F, on_task_cancel: G) -> Result<()>
     where
-        F: Fn(TaskDispatchData) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + Clone + 'static,
+        Fut1: std::future::Future<Output = ()> + Send,
+        G: Fn(i64) -> Fut2 + Send + Sync + Clone + 'static,
+        Fut2: std::future::Future<Output = ()> + Send,
     {
         let url = self.ws_url()?;
         let (ws_stream, _) = connect_async(url.as_str()).await?;
@@ -294,7 +308,7 @@ impl AgentClient {
                 Ok(Message::Text(text)) => {
                     match serde_json::from_str::<ServerMessage>(&text) {
                         Ok(server_msg) => {
-                            self.handle_message(server_msg, on_task_dispatch.clone()).await;
+                            self.handle_message(server_msg, on_task_dispatch.clone(), on_task_cancel.clone()).await;
                         }
                         Err(e) => {
                             warn!("Failed to parse message: {} - {}", e, text);
@@ -326,10 +340,12 @@ impl AgentClient {
     }
 
     /// 处理接收到的消息
-    async fn handle_message<F, Fut>(&self, message: ServerMessage, on_task_dispatch: F)
+    async fn handle_message<F, G, Fut1, Fut2>(&self, message: ServerMessage, on_task_dispatch: F, on_task_cancel: G)
     where
-        F: Fn(TaskDispatchData) -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: Fn(TaskDispatchData) -> Fut1 + Send + Sync,
+        Fut1: std::future::Future<Output = ()> + Send,
+        G: Fn(i64) -> Fut2 + Send + Sync,
+        Fut2: std::future::Future<Output = ()> + Send,
     {
         match message {
             ServerMessage::Connected { message } => {
@@ -362,6 +378,10 @@ impl AgentClient {
                     environment,
                 };
                 on_task_dispatch(data).await;
+            }
+            ServerMessage::TaskCancel { task_id } => {
+                info!("Received task cancel: {}", task_id);
+                on_task_cancel(task_id).await;
             }
         }
     }

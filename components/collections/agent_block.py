@@ -16,13 +16,15 @@ class AgentBlockService(Service):
     def execute(self, data, parent_data):
         workspace_label = data.get_one_of_inputs('workspace_label', '')
         timeout = data.get_one_of_inputs('timeout', MAX_WAIT_FOR_WORKSPACE)
+        pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         
         data.set_outputs('_workspace_label', workspace_label)
         data.set_outputs('_timeout', int(timeout) if timeout else MAX_WAIT_FOR_WORKSPACE)
         data.set_outputs('_wait_start_time', timezone.now())
+        data.set_outputs('_pipeline_id', pipeline_id)
         
         # 尝试立即获取 workspace
-        workspace = self._try_acquire_workspace(workspace_label)
+        workspace = self._try_acquire_workspace(workspace_label, pipeline_id)
         
         if workspace:
             self._set_success_outputs(data, workspace)
@@ -31,7 +33,7 @@ class AgentBlockService(Service):
         else:
             return True
     
-    def _try_acquire_workspace(self, workspace_label):
+    def _try_acquire_workspace(self, workspace_label, pipeline_id=''):
         from client_agents.models import AgentWorkspace
         
         base_qs = AgentWorkspace.objects.filter(
@@ -55,7 +57,8 @@ class AgentBlockService(Service):
                 
                 if ws:
                     ws.status = 'RUNNING'
-                    ws.save(update_fields=['status'])
+                    ws.pipeline_id = pipeline_id
+                    ws.save(update_fields=['status', 'pipeline_id'])
                     return ws
         
         return None
@@ -85,7 +88,8 @@ class AgentBlockService(Service):
                 return False
 
         workspace_label = data.get_one_of_outputs('_workspace_label', '')
-        workspace = self._try_acquire_workspace(workspace_label)
+        pipeline_id = data.get_one_of_outputs('_pipeline_id', '')
+        workspace = self._try_acquire_workspace(workspace_label, pipeline_id)
         
         if workspace:
             self._set_success_outputs(data, workspace)

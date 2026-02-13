@@ -16,8 +16,8 @@ class AgentReleaseService(Service):
             workspace = AgentWorkspace.objects.get(id=workspace_id)
             if workspace.status == 'RUNNING':
                 workspace.status = 'IDLE'
-                workspace.current_task = None
-                workspace.save(update_fields=['status', 'current_task'])
+                workspace.pipeline_id = ''
+                workspace.save(update_fields=['status', 'pipeline_id'])
                 return True
             else:
                 return True

@@ -21,6 +21,7 @@ class ClientAgentService(Service):
         timeout = data.get_one_of_inputs('timeout', 3600)
         client_repo_url = data.get_one_of_inputs('client_repo_url', '')
         client_repo_ref = data.get_one_of_inputs('client_repo_ref', 'main')
+        pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         
         if not command:
             data.outputs.ex_data = 'No command provided'
@@ -30,6 +31,7 @@ class ClientAgentService(Service):
         data.set_outputs('_timeout', int(timeout) if timeout else 3600)
         data.set_outputs('_client_repo_url', client_repo_url)
         data.set_outputs('_client_repo_ref', client_repo_ref)
+        data.set_outputs('_pipeline_id', pipeline_id)
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         
         try:
@@ -49,11 +51,13 @@ class ClientAgentService(Service):
         timeout = data.get_one_of_outputs('_timeout', 3600)
         client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
         client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
+        pipeline_id = data.get_one_of_outputs('_pipeline_id', '')
         
         try:
             agent_task = AgentTask.objects.create(
                 agent=agent,
                 workspace=workspace,
+                pipeline_id=pipeline_id,
                 client_repo_url=client_repo_url,
                 client_repo_ref=client_repo_ref,
                 command=command,
@@ -123,6 +127,19 @@ class ClientAgentService(Service):
             return status == 'COMPLETED'
         
         if status in ['DISPATCHED', 'RUNNING']:
+            # Check heartbeat timeout for running tasks
+            if status == 'RUNNING' and task.last_heartbeat:
+                heartbeat_elapsed = (timezone.now() - task.last_heartbeat).total_seconds()
+                if heartbeat_elapsed > 60:  # 60 seconds heartbeat timeout
+                    AgentTask.objects.filter(id=task_id).update(
+                        status='FAILED',
+                        error_message='Task heartbeat timeout',
+                        finished_at=timezone.now()
+                    )
+                    data.outputs.ex_data = 'Task heartbeat timeout'
+                    self.finish_schedule()
+                    return False
+            
             dispatch_time_str = data.get_one_of_outputs('_dispatch_time')
             timeout = data.get_one_of_outputs('_timeout', 3600)
             
