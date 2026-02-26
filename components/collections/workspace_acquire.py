@@ -20,19 +20,18 @@ class WorkspaceAcquireService(Service):
 
         workspace_label = data.get_one_of_inputs('workspace_label', '')
         timeout = data.get_one_of_inputs('timeout', MAX_WAIT_FOR_WORKSPACE)
-        client_repo_url = data.get_one_of_inputs('client_repo_url', '')
+        client_repo_url = ''
         client_repo_ref = data.get_one_of_inputs('client_repo_ref', '')
         client_repo_token = ''
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         project_id = parent_data.get_one_of_inputs('project_id', '')
 
-        # Read agent repo config from project extra_config as defaults
+        # Read agent repo config from project extra_config
         if project_id:
             try:
                 project = Project.objects.get(id=project_id)
                 extra_config = project.extra_config or {}
-                if not client_repo_url:
-                    client_repo_url = extra_config.get('agent_repo_url', '')
+                client_repo_url = extra_config.get('agent_repo_url', '')
                 if not client_repo_ref:
                     client_repo_ref = extra_config.get('agent_repo_ref', 'main')
                 client_repo_token = extra_config.get('agent_repo_token', '')
@@ -217,10 +216,18 @@ class WorkspaceAcquireService(Service):
                 return False
 
             if task.status == 'COMPLETED':
+                data.set_outputs('task_id', task.id)
+                data.set_outputs('exit_code', task.exit_code if task.exit_code is not None else 0)
+                data.set_outputs('stdout', task.stdout or '')
+                data.set_outputs('stderr', task.stderr or '')
                 data.set_outputs('_phase', 'done')
                 self.finish_schedule()
                 return True
             elif task.status in ['FAILED', 'TIMEOUT']:
+                data.set_outputs('task_id', task.id)
+                data.set_outputs('exit_code', task.exit_code if task.exit_code is not None else -1)
+                data.set_outputs('stdout', task.stdout or '')
+                data.set_outputs('stderr', task.stderr or '')
                 data.outputs.ex_data = f'Repo clone/update failed: {task.error_message or task.stderr}'
                 self.finish_schedule()
                 return False
@@ -236,7 +243,6 @@ class WorkspaceAcquireService(Service):
         return [
             self.InputItem(name='Workspace Label', key='workspace_label', type='string', required=False),
             self.InputItem(name='Timeout (s)', key='timeout', type='int', required=False),
-            self.InputItem(name='Client Repo URL', key='client_repo_url', type='string', required=False),
             self.InputItem(name='Client Repo Ref', key='client_repo_ref', type='string', required=False),
         ]
     
@@ -245,6 +251,10 @@ class WorkspaceAcquireService(Service):
             self.OutputItem(name='Workspace ID', key='workspace_id', type='int'),
             self.OutputItem(name='Workspace Name', key='workspace_name', type='string'),
             self.OutputItem(name='Agent Name', key='agent_name', type='string'),
+            self.OutputItem(name='Task ID', key='task_id', type='int'),
+            self.OutputItem(name='Exit Code', key='exit_code', type='int'),
+            self.OutputItem(name='Standard Output', key='stdout', type='string'),
+            self.OutputItem(name='Standard Error', key='stderr', type='string'),
         ]
 
 
