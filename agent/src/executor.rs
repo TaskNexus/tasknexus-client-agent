@@ -105,6 +105,10 @@ impl CommandExecutor {
             }
         }
 
+        // 抑制 macOS 终端会话恢复（zsh -i 触发）
+        #[cfg(target_os = "macos")]
+        cmd.env("SHELL_SESSION_DID_INIT", "1");
+
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
