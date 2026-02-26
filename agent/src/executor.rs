@@ -267,6 +267,7 @@ impl TaskRunner {
         workspace_name: &str,
         client_repo_url: Option<&str>,
         client_repo_ref: &str,
+        client_repo_token: Option<&str>,
         timeout_secs: u64,
         on_output: Option<F>,
         environment: Option<HashMap<String, String>>,
@@ -316,20 +317,34 @@ impl TaskRunner {
                 if !repo_path.exists() {
                     // 自动 clone 仓库
                     info!("Cloning repository {} to {:?}", repo_url, repo_path);
-                    let result = self.clone_repo(repo_url, &repo_path, client_repo_ref).await;
+                    let result = self.clone_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
                     if result.exit_code != 0 {
                         return result;
                     }
                 } else {
                     // 尝试 pull 最新代码
                     info!("Updating repository: {:?}", repo_path);
-                    let update_result = self.update_repo(&repo_path, client_repo_ref).await;
+                    let update_result = self.update_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
                     if update_result.exit_code != 0 {
                         warn!("Failed to update repository (will continue anyway)");
                     }
                 }
 
                 exec_dir = repo_path;
+            }
+        }
+
+        // If no repo_url was provided, auto-detect existing git repo in workspace
+        if exec_dir == workspace_dir {
+            if let Ok(entries) = std::fs::read_dir(&workspace_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && path.join(".git").exists() {
+                        info!("Auto-detected repo directory: {:?}", path);
+                        exec_dir = path;
+                        break;
+                    }
+                }
             }
         }
 
@@ -366,51 +381,96 @@ impl TaskRunner {
         result
     }
 
+    /// Inject token into an HTTPS URL for authenticated git operations
+    fn inject_token_into_url(repo_url: &str, token: Option<&str>) -> String {
+        match token {
+            Some(t) if !t.is_empty() => {
+                if let Some(rest) = repo_url.strip_prefix("https://") {
+                    format!("https://oauth2:{}@{}", t, rest)
+                } else if let Some(rest) = repo_url.strip_prefix("http://") {
+                    format!("http://oauth2:{}@{}", t, rest)
+                } else {
+                    // For non-HTTP URLs (e.g. SSH), return as-is
+                    repo_url.to_string()
+                }
+            }
+            _ => repo_url.to_string(),
+        }
+    }
+
     /// Clone a git repository
-    async fn clone_repo(
+    async fn clone_repo<F, Fut>(
         &self,
         repo_url: &str,
         target_path: &Path,
         ref_name: &str,
-    ) -> ExecutionResult {
+        token: Option<&str>,
+        on_output: Option<F>,
+    ) -> ExecutionResult
+    where
+        F: Fn(String, bool) -> Fut + Send + Clone + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let repo_name = target_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("repo");
 
+        let auth_url = Self::inject_token_into_url(repo_url, token);
+
         let clone_cmd = format!(
             "git clone --depth 1 --branch {} {} {}",
-            ref_name, repo_url, repo_name
+            ref_name, auth_url, repo_name
         );
 
-        info!("Cloning: {} (in {:?})", clone_cmd, target_path.parent());
+        info!("Cloning: {} (in {:?})", repo_url, target_path.parent());
+
+        let mut env = HashMap::new();
+        env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
 
         self.executor
-            .execute::<fn(String, bool) -> std::future::Ready<()>, _>(
+            .execute(
                 &clone_cmd,
                 target_path.parent(),
-                None,
+                Some(&env),
                 Some(300), // 5 minutes for clone
-                None,
+                on_output,
                 None,
             )
             .await
     }
 
     /// Update a git repository
-    async fn update_repo(&self, repo_path: &Path, ref_name: &str) -> ExecutionResult {
+    async fn update_repo<F, Fut>(
+        &self,
+        repo_url: &str,
+        repo_path: &Path,
+        ref_name: &str,
+        token: Option<&str>,
+        on_output: Option<F>,
+    ) -> ExecutionResult
+    where
+        F: Fn(String, bool) -> Fut + Send + Clone + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        // Use the same token injection as clone for authentication
+        let auth_url = Self::inject_token_into_url(repo_url, token);
+
         let update_cmd = format!(
-            "git fetch origin {} && git reset --hard origin/{}",
-            ref_name, ref_name
+            "git fetch {} {} && git reset --hard FETCH_HEAD",
+            auth_url, ref_name
         );
 
+        let mut env = HashMap::new();
+        env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+
         self.executor
-            .execute::<fn(String, bool) -> std::future::Ready<()>, _>(
+            .execute(
                 &update_cmd,
                 Some(repo_path),
-                None,
+                Some(&env),
                 Some(120), // 2 minutes for update
-                None,
+                on_output,
                 None,
             )
             .await

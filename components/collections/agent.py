@@ -19,8 +19,6 @@ class ClientAgentService(Service):
         workspace_id = data.get_one_of_inputs('workspace_id')
         command = data.get_one_of_inputs('command', '')
         timeout = data.get_one_of_inputs('timeout', 3600)
-        client_repo_url = data.get_one_of_inputs('client_repo_url', '')
-        client_repo_ref = data.get_one_of_inputs('client_repo_ref', 'main')
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         
         if not command:
@@ -29,8 +27,6 @@ class ClientAgentService(Service):
         
         data.set_outputs('_command', command)
         data.set_outputs('_timeout', int(timeout) if timeout else 3600)
-        data.set_outputs('_client_repo_url', client_repo_url)
-        data.set_outputs('_client_repo_ref', client_repo_ref)
         data.set_outputs('_pipeline_id', pipeline_id)
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         
@@ -49,8 +45,6 @@ class ClientAgentService(Service):
         agent = workspace.agent
         command = data.get_one_of_outputs('_command')
         timeout = data.get_one_of_outputs('_timeout', 3600)
-        client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
-        client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
         pipeline_id = data.get_one_of_outputs('_pipeline_id', '')
         
         try:
@@ -58,8 +52,6 @@ class ClientAgentService(Service):
                 agent=agent,
                 workspace=workspace,
                 pipeline_id=pipeline_id,
-                client_repo_url=client_repo_url,
-                client_repo_ref=client_repo_ref,
                 command=command,
                 timeout=timeout,
                 status='DISPATCHED',
@@ -81,8 +73,9 @@ class ClientAgentService(Service):
                     "type": "task_dispatch",
                     "task_id": task_id,
                     "workspace_name": workspace.name,
-                    "client_repo_url": client_repo_url,
-                    "client_repo_ref": client_repo_ref,
+                    "client_repo_url": '',
+                    "client_repo_ref": 'main',
+                    "client_repo_token": '',
                     "command": command,
                     "timeout": timeout,
                     "environment": agent.environment,
@@ -168,8 +161,6 @@ class ClientAgentService(Service):
             self.InputItem(name='Workspace ID', key='workspace_id', type='int', required=True),
             self.InputItem(name='Command', key='command', type='string', required=True),
             self.InputItem(name='Timeout (s)', key='timeout', type='int', required=False),
-            self.InputItem(name='Client Repo URL', key='client_repo_url', type='string', required=False),
-            self.InputItem(name='Client Repo Ref', key='client_repo_ref', type='string', required=False),
         ]
 
     def outputs_format(self):
@@ -184,6 +175,6 @@ class ClientAgentComponent(Component):
     name = 'Client Agent'
     code = 'client_agent'
     bound_service = ClientAgentService
-    version = '1.2'
+    version = '1.3'
     category = 'ClientAgent'
     description = '将命令分发给客户端代理执行'

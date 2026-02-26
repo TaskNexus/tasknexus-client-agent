@@ -197,6 +197,7 @@ impl Agent {
             &data.workspace_name,
             data.client_repo_url.as_deref(),
             &data.client_repo_ref,
+            data.client_repo_token.as_deref(),
             data.timeout,
             Some(output_callback),
             if data.environment.is_empty() { None } else { Some(data.environment) },

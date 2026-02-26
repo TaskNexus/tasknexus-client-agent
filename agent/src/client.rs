@@ -34,6 +34,8 @@ pub enum ServerMessage {
         client_repo_url: Option<String>,
         #[serde(default = "default_ref")]
         client_repo_ref: String,
+        #[serde(default)]
+        client_repo_token: Option<String>,
         #[serde(default = "default_timeout")]
         timeout: u64,
         #[serde(default)]
@@ -72,6 +74,7 @@ pub struct TaskDispatchData {
     pub command: String,
     pub client_repo_url: Option<String>,
     pub client_repo_ref: String,
+    pub client_repo_token: Option<String>,
     pub timeout: u64,
     pub environment: HashMap<String, String>,
 }
@@ -360,6 +363,7 @@ impl AgentClient {
                 command,
                 client_repo_url,
                 client_repo_ref,
+                client_repo_token,
                 timeout,
                 environment,
             } => {
@@ -374,6 +378,7 @@ impl AgentClient {
                     command,
                     client_repo_url,
                     client_repo_ref,
+                    client_repo_token,
                     timeout,
                     environment,
                 };

@@ -5,7 +5,7 @@ from pipeline.core.flow.activity import Service
 logger = logging.getLogger('django')
 
 
-class AgentReleaseService(Service):
+class WorkspaceReleaseService(Service):
     def execute(self, data, parent_data):
         from client_agents.models import AgentWorkspace
         workspace_id = data.get_one_of_inputs('workspace_id')
@@ -36,10 +36,10 @@ class AgentReleaseService(Service):
         return []
 
 
-class AgentReleaseComponent(Component):
-    name = 'Agent Release'
-    code = 'agent_release'
-    bound_service = AgentReleaseService
+class WorkspaceReleaseComponent(Component):
+    name = 'Workspace Release'
+    code = 'workspace_release'
+    bound_service = WorkspaceReleaseService
     version = '1.0'
     category = 'ClientAgent'
     description = '释放工作空间'
