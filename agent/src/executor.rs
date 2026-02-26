@@ -52,23 +52,56 @@ impl CommandExecutor {
             info!("Working directory: {:?}", dir);
         }
 
-        // 根据平台选择 shell
-        #[cfg(windows)]
-        let (shell, shell_arg) = ("cmd", "/C");
-        #[cfg(not(windows))]
-        let (shell, shell_arg) = ("sh", "-c");
+        // 从环境变量读取 SHELL，未设置则按平台使用默认值
+        let shell_from_env = environment
+            .and_then(|env| env.get("SHELL").cloned());
 
-        let mut cmd = Command::new(shell);
-        cmd.arg(shell_arg).arg(command);
+        let default_shell = {
+            #[cfg(target_os = "macos")]
+            { "/bin/zsh" }
+            #[cfg(target_os = "linux")]
+            { "/bin/bash" }
+            #[cfg(windows)]
+            { "cmd" }
+        };
+
+        let shell_path = shell_from_env
+            .as_deref()
+            .unwrap_or(default_shell);
+
+        // 提取 shell 基本名称用于参数映射
+        let shell_name = shell_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(shell_path)
+            .rsplit('\\')
+            .next()
+            .unwrap_or(shell_path);
+
+        info!("Using shell: {} ({})", shell_path, shell_name);
+
+        // 根据 shell 名称选择参数
+        let shell_args: Vec<&str> = match shell_name {
+            "zsh" | "bash" => vec!["-l", "-i", "-c"],
+            "sh" => vec!["-c"],
+            "cmd" | "cmd.exe" => vec!["/C"],
+            "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => vec!["-Command"],
+            _ => vec!["-c"],
+        };
+
+        let mut cmd = Command::new(shell_path);
+        cmd.args(&shell_args).arg(command);
 
         if let Some(dir) = working_dir {
             cmd.current_dir(dir);
         }
 
-        // 设置环境变量
+        // 设置环境变量（过滤掉 SHELL，仅供内部使用）
         if let Some(env) = environment {
             for (key, value) in env {
-                cmd.env(key, value);
+                if key != "SHELL" {
+                    cmd.env(key, value);
+                }
             }
         }
 
