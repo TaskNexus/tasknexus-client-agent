@@ -112,9 +112,7 @@ class WorkspaceAcquireService(Service):
         client_repo_token = data.get_one_of_outputs('_client_repo_token', '')
         pipeline_id = data.get_one_of_outputs('_pipeline_id', '')
 
-        # Use a no-op command; the Rust agent will clone/update the repo
-        # before running the command, and 'echo' will succeed immediately.
-        clone_command = 'echo "Repo setup complete"'
+        clone_command = ''
 
         try:
             agent_task = AgentTask.objects.create(

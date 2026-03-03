@@ -336,54 +336,63 @@ impl TaskRunner {
             };
         }
 
-        // 确定执行目录
-        let mut exec_dir = workspace_dir.clone();
+        // 确定执行目录: 始终使用 workspace 目录作为 cwd
+        let exec_dir = workspace_dir.clone();
 
-        if let Some(repo_url) = client_repo_url {
-            if !repo_url.is_empty() {
-                // 从 URL 提取仓库名称
-                let repo_name = repo_url
-                    .trim_end_matches('/')
+        // 从 URL 提取仓库名称，连字符替换为下划线以兼容 Python 包名
+        let repo_name = client_repo_url
+            .filter(|u| !u.is_empty())
+            .map(|u| {
+                u.trim_end_matches('/')
                     .split('/')
                     .last()
                     .unwrap_or("repo")
-                    .trim_end_matches(".git");
+                    .trim_end_matches(".git")
+                    .replace('-', "_")
+            });
 
-                let repo_path = workspace_dir.join(repo_name);
+        // command 为空时，执行 clone/update 后直接返回（workspace_acquire 阶段）
+        if command.is_empty() {
+            if let Some(ref repo_name) = repo_name {
+                if let Some(repo_url) = client_repo_url {
+                    let repo_path = workspace_dir.join(repo_name);
 
-                if !repo_path.exists() {
-                    // 自动 clone 仓库
-                    info!("Cloning repository {} to {:?}", repo_url, repo_path);
-                    let result = self.clone_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
-                    if result.exit_code != 0 {
-                        return result;
-                    }
-                } else {
-                    // 尝试 pull 最新代码
-                    info!("Updating repository: {:?}", repo_path);
-                    let update_result = self.update_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
-                    if update_result.exit_code != 0 {
-                        warn!("Failed to update repository (will continue anyway)");
-                    }
-                }
-
-                exec_dir = repo_path;
-            }
-        }
-
-        // If no repo_url was provided, auto-detect existing git repo in workspace
-        if exec_dir == workspace_dir {
-            if let Ok(entries) = std::fs::read_dir(&workspace_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() && path.join(".git").exists() {
-                        info!("Auto-detected repo directory: {:?}", path);
-                        exec_dir = path;
-                        break;
+                    if !repo_path.exists() {
+                        info!("Cloning repository {} to {:?}", repo_url, repo_path);
+                        let result = self.clone_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
+                        if result.exit_code != 0 {
+                            return result;
+                        }
+                    } else {
+                        info!("Updating repository: {:?}", repo_path);
+                        let update_result = self.update_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
+                        if update_result.exit_code != 0 {
+                            warn!("Failed to update repository (will continue anyway)");
+                        }
                     }
                 }
             }
+
+            info!("No command specified, skipping script execution");
+            return ExecutionResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                cancelled: false,
+            };
         }
+
+        // 根据仓库名和脚本路径构建实际执行命令
+        // command 为相对于仓库根目录的脚本路径，如 "entries/project_setup.py"
+        // 拼接为 "{repo_name}/{command}"，再根据扩展名生成执行命令
+        let actual_command = if let Some(ref repo_name) = repo_name {
+            let script_path = format!("{}/{}", repo_name, command);
+            Self::build_script_command(&script_path)
+        } else {
+            Self::build_script_command(command)
+        };
+        info!("Resolved command: {}", actual_command);
 
         // 设置环境变量
         let mut task_env = HashMap::new();
@@ -399,7 +408,7 @@ impl TaskRunner {
         let result = self
             .executor
             .execute(
-                command,
+                &actual_command,
                 Some(&exec_dir),
                 Some(&task_env),
                 Some(timeout_secs),
@@ -416,6 +425,19 @@ impl TaskRunner {
         }
 
         result
+    }
+
+    /// 根据脚本路径的扩展名生成执行命令
+    fn build_script_command(script_path: &str) -> String {
+        let ext = script_path.rsplit('.').next().unwrap_or("");
+        match ext {
+            "py" => format!("python {}", script_path),
+            "sh" => format!("bash {}", script_path),
+            "js" => format!("node {}", script_path),
+            "ts" => format!("npx ts-node {}", script_path),
+            "rb" => format!("ruby {}", script_path),
+            _    => script_path.to_string(),
+        }
     }
 
     /// Inject token into an HTTPS URL for authenticated git operations

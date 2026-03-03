@@ -15,19 +15,38 @@ class ClientAgentService(Service):
     
     def execute(self, data, parent_data):
         from client_agents.models import ClientAgent, AgentWorkspace
+        from projects.models import Project
         
         workspace_id = data.get_one_of_inputs('workspace_id')
         command = data.get_one_of_inputs('command', '')
         timeout = data.get_one_of_inputs('timeout', 3600)
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
+        project_id = parent_data.get_one_of_inputs('project_id', '')
         
         if not command:
             data.outputs.ex_data = 'No command provided'
             return False
+
+        # 从项目配置读取仓库信息
+        client_repo_url = ''
+        client_repo_ref = 'main'
+        client_repo_token = ''
+        if project_id:
+            try:
+                project = Project.objects.get(id=project_id)
+                extra_config = project.extra_config or {}
+                client_repo_url = extra_config.get('agent_repo_url', '')
+                client_repo_ref = extra_config.get('agent_repo_ref', 'main')
+                client_repo_token = extra_config.get('agent_repo_token', '')
+            except Project.DoesNotExist:
+                pass
         
         data.set_outputs('_command', command)
         data.set_outputs('_timeout', int(timeout) if timeout else 3600)
         data.set_outputs('_pipeline_id', pipeline_id)
+        data.set_outputs('_client_repo_url', client_repo_url)
+        data.set_outputs('_client_repo_ref', client_repo_ref)
+        data.set_outputs('_client_repo_token', client_repo_token)
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         
         try:
@@ -46,6 +65,9 @@ class ClientAgentService(Service):
         command = data.get_one_of_outputs('_command')
         timeout = data.get_one_of_outputs('_timeout', 3600)
         pipeline_id = data.get_one_of_outputs('_pipeline_id', '')
+        client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
+        client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
+        client_repo_token = data.get_one_of_outputs('_client_repo_token', '')
         
         try:
             agent_task = AgentTask.objects.create(
@@ -73,9 +95,9 @@ class ClientAgentService(Service):
                     "type": "task_dispatch",
                     "task_id": task_id,
                     "workspace_name": workspace.name,
-                    "client_repo_url": '',
-                    "client_repo_ref": 'main',
-                    "client_repo_token": '',
+                    "client_repo_url": client_repo_url,
+                    "client_repo_ref": client_repo_ref,
+                    "client_repo_token": client_repo_token,
                     "command": command,
                     "timeout": timeout,
                     "environment": agent.environment,
@@ -159,7 +181,7 @@ class ClientAgentService(Service):
     def inputs_format(self):
         return [
             self.InputItem(name='Workspace ID', key='workspace_id', type='int', required=True),
-            self.InputItem(name='Command', key='command', type='string', required=True),
+            self.InputItem(name='Script Path', key='command', type='string', required=True),
             self.InputItem(name='Timeout (s)', key='timeout', type='int', required=False),
         ]
 
@@ -177,4 +199,4 @@ class ClientAgentComponent(Component):
     bound_service = ClientAgentService
     version = '1.3'
     category = 'ClientAgent'
-    description = '将命令分发给客户端代理执行'
+    description = '将脚本分发给客户端代理执行'
