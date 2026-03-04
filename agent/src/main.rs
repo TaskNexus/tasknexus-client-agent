@@ -181,14 +181,34 @@ impl Agent {
             }
         });
 
-        // 创建输出回调
-        let client = self.client.clone();
+        // 创建日志缓冲区，按批次发送（每 500ms）
+        let log_buffer: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        // 输出回调 — 只缓冲日志行，不立即发送
+        let buffer_for_callback = log_buffer.clone();
         let output_callback = move |line: String, _is_stderr: bool| {
-            let client = client.clone();
+            let buffer = buffer_for_callback.clone();
             async move {
-                let _ = client.send_task_progress(task_id, line).await;
+                buffer.lock().await.push(line);
             }
         };
+
+        // 日志批量发送任务 — 每 500ms flush 一次缓冲区
+        let flush_client = self.client.clone();
+        let flush_buffer = log_buffer.clone();
+        let log_flush_task = tokio::spawn(async move {
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let mut buf = flush_buffer.lock().await;
+                if !buf.is_empty() {
+                    let batch = buf.join("\n");
+                    buf.clear();
+                    drop(buf); // 释放锁再 await
+                    let _ = flush_client.send_task_progress(task_id, batch).await;
+                }
+            }
+        });
 
         // 执行任务，传入取消信号
         let result = self.task_runner.run_task(
@@ -204,8 +224,20 @@ impl Agent {
             Some(cancel_rx),
         ).await;
 
-        // 停止心跳发送器
+        // 停止日志批量发送和心跳
+        log_flush_task.abort();
         heartbeat_task.abort();
+
+        // Flush 剩余缓冲的日志
+        {
+            let mut buf = log_buffer.lock().await;
+            if !buf.is_empty() {
+                let batch = buf.join("\n");
+                buf.clear();
+                drop(buf);
+                let _ = self.client.send_task_progress(task_id, batch).await;
+            }
+        }
 
         // 发送结果
         if result.cancelled {

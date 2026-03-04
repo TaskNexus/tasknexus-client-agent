@@ -257,9 +257,13 @@ impl CommandExecutor {
         });
 
         // Wait for completion with timeout and cancellation
+        // 注意：callback_handle 必须在 stdout/stderr handle 之后等待，
+        // 确保所有日志发送回调完成后才返回，避免任务完成了但日志还没发完
         let timed_future = timeout(Duration::from_secs(timeout_secs), async {
             let stdout_lines = stdout_handle.await.unwrap_or_default();
             let stderr_lines = stderr_handle.await.unwrap_or_default();
+            // 等待所有日志发送完毕（senders 已 drop，rx 会自然结束）
+            let _ = callback_handle.await;
             let status = child.wait().await;
             (stdout_lines, stderr_lines, status)
         });
@@ -268,7 +272,6 @@ impl CommandExecutor {
         if let Some(mut cancel_rx) = cancel_rx {
             tokio::select! {
                 result = timed_future => {
-                    drop(callback_handle);
                     match result {
                         Ok((stdout_lines, stderr_lines, status)) => {
                             let exit_code = status
@@ -298,7 +301,6 @@ impl CommandExecutor {
                 _ = cancel_rx.changed() => {
                     warn!("Command cancelled");
                     kill_process_tree(&mut child).await;
-                    drop(callback_handle);
                     ExecutionResult {
                         exit_code: -1,
                         stdout: stdout_chunks.join("\n"),
@@ -311,7 +313,6 @@ impl CommandExecutor {
         } else {
             // No cancellation - original behavior
             let result = timed_future.await;
-            drop(callback_handle);
             match result {
                 Ok((stdout_lines, stderr_lines, status)) => {
                     let exit_code = status

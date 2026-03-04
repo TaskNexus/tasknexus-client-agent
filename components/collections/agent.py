@@ -148,7 +148,7 @@ class ClientAgentService(Service):
             # Check heartbeat timeout for running tasks
             if status == 'RUNNING' and task.last_heartbeat:
                 heartbeat_elapsed = (timezone.now() - task.last_heartbeat).total_seconds()
-                if heartbeat_elapsed > 60:  # 60 seconds heartbeat timeout
+                if heartbeat_elapsed > 120:  # 120 seconds heartbeat timeout
                     AgentTask.objects.filter(id=task_id).update(
                         status='FAILED',
                         error_message='Task heartbeat timeout',
