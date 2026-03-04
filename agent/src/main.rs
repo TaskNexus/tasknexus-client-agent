@@ -2,6 +2,7 @@
 //!
 //! 提供命令行接口和 Agent 运行逻辑。
 
+use chrono::Local;
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -188,8 +189,9 @@ impl Agent {
         let buffer_for_callback = log_buffer.clone();
         let output_callback = move |line: String, _is_stderr: bool| {
             let buffer = buffer_for_callback.clone();
+            let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
             async move {
-                buffer.lock().await.push(line);
+                buffer.lock().await.push(format!("[{}] {}", timestamp, line));
             }
         };
 

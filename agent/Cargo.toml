@@ -22,6 +22,7 @@ hostname = "0.4"
 sysinfo = "0.30"
 url = "2"
 auto-launch = "0.6"
+chrono = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
