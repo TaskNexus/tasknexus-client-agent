@@ -133,6 +133,14 @@ class ClientAgentService(Service):
         
         status = task.status
         
+        if status == 'CANCELLED':
+            data.set_outputs('exit_code', -1)
+            data.set_outputs('stdout', task.stdout or '')
+            data.set_outputs('stderr', 'Task was cancelled')
+            data.outputs.ex_data = task.error_message or 'Task cancelled'
+            self.finish_schedule()
+            return False
+        
         if status in ['COMPLETED', 'FAILED', 'TIMEOUT']:
             data.set_outputs('exit_code', task.exit_code if task.exit_code is not None else -1)
             data.set_outputs('stdout', task.stdout)

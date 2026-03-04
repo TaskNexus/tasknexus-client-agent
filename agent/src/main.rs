@@ -209,13 +209,7 @@ impl Agent {
 
         // 发送结果
         if result.cancelled {
-            info!("Task {} was cancelled", task_id);
-            let _ = self.client.send_task_completed(
-                task_id,
-                -1,
-                String::new(),
-                "Task was cancelled".to_string(),
-            ).await;
+            info!("Task {} was cancelled, not sending completion (server already handled)", task_id);
         } else if result.exit_code == 0 {
             if let Err(e) = self.client.send_task_completed(
                 task_id,
