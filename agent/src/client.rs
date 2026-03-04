@@ -172,7 +172,7 @@ impl AgentClient {
     ) -> Result<()>
     where
         F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + Clone + 'static,
-        Fut1: std::future::Future<Output = ()> + Send,
+        Fut1: std::future::Future<Output = ()> + Send + 'static,
         G: Fn(i64) -> Fut2 + Send + Sync + Clone + 'static,
         Fut2: std::future::Future<Output = ()> + Send,
     {
@@ -263,7 +263,7 @@ impl AgentClient {
     async fn message_loop<F, G, Fut1, Fut2>(&self, on_task_dispatch: F, on_task_cancel: G) -> Result<()>
     where
         F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + Clone + 'static,
-        Fut1: std::future::Future<Output = ()> + Send,
+        Fut1: std::future::Future<Output = ()> + Send + 'static,
         G: Fn(i64) -> Fut2 + Send + Sync + Clone + 'static,
         Fut2: std::future::Future<Output = ()> + Send,
     {
@@ -345,8 +345,8 @@ impl AgentClient {
     /// 处理接收到的消息
     async fn handle_message<F, G, Fut1, Fut2>(&self, message: ServerMessage, on_task_dispatch: F, on_task_cancel: G)
     where
-        F: Fn(TaskDispatchData) -> Fut1 + Send + Sync,
-        Fut1: std::future::Future<Output = ()> + Send,
+        F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + 'static,
+        Fut1: std::future::Future<Output = ()> + Send + 'static,
         G: Fn(i64) -> Fut2 + Send + Sync,
         Fut2: std::future::Future<Output = ()> + Send,
     {
@@ -382,7 +382,10 @@ impl AgentClient {
                     timeout,
                     environment,
                 };
-                on_task_dispatch(data).await;
+                // 在后台任务中执行，不阻塞消息接收循环，以便能接收 TaskCancel 消息
+                tokio::spawn(async move {
+                    on_task_dispatch(data).await;
+                });
             }
             ServerMessage::TaskCancel { task_id } => {
                 info!("Received task cancel: {}", task_id);
