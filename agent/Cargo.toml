@@ -23,6 +23,9 @@ sysinfo = "0.30"
 url = "2"
 auto-launch = "0.6"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 lto = true
 codegen-units = 1

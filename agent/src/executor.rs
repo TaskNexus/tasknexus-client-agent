@@ -6,10 +6,43 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
+
+/// 杀死进程及其所有子进程
+async fn kill_process_tree(child: &mut Child) {
+    let pid = match child.id() {
+        Some(pid) => pid,
+        None => {
+            warn!("Process already exited, no pid to kill");
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        // 使用 killpg 杀死整个进程组
+        let pgid = pid as libc::pid_t;
+        info!("Killing process group {}", pgid);
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // 使用 taskkill /F /T 递归杀死进程树
+        info!("Killing process tree for PID {}", pid);
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    }
+
+    // 等待子进程退出，防止僵尸进程
+    let _ = child.wait().await;
+}
 
 /// 命令执行结果
 #[derive(Debug)]
@@ -129,6 +162,18 @@ impl CommandExecutor {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Unix: 使用 setsid 创建新进程组，以便后续可以 killpg 杀死整个进程树
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
         // 在 Windows 上使用 CREATE_NO_WINDOW 标志
         #[cfg(windows)]
         {
@@ -239,7 +284,7 @@ impl CommandExecutor {
                         }
                         Err(_) => {
                             warn!("Command timed out after {} seconds", timeout_secs);
-                            let _ = child.kill().await;
+                            kill_process_tree(&mut child).await;
                             ExecutionResult {
                                 exit_code: -1,
                                 stdout: stdout_chunks.join("\n"),
@@ -252,7 +297,7 @@ impl CommandExecutor {
                 }
                 _ = cancel_rx.changed() => {
                     warn!("Command cancelled");
-                    let _ = child.kill().await;
+                    kill_process_tree(&mut child).await;
                     drop(callback_handle);
                     ExecutionResult {
                         exit_code: -1,
@@ -282,7 +327,7 @@ impl CommandExecutor {
                 }
                 Err(_) => {
                     warn!("Command timed out after {} seconds", timeout_secs);
-                    let _ = child.kill().await;
+                    kill_process_tree(&mut child).await;
                     ExecutionResult {
                         exit_code: -1,
                         stdout: stdout_chunks.join("\n"),
