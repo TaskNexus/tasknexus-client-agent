@@ -90,7 +90,20 @@ impl CommandExecutor {
         };
 
         let mut cmd = Command::new(shell_path);
-        cmd.args(&shell_args).arg(command);
+
+        // Windows cmd.exe 默认使用 GBK 编码，切换代码页为 UTF-8 (65001)
+        #[cfg(windows)]
+        let actual_cmd = {
+            if shell_name == "cmd" || shell_name == "cmd.exe" {
+                format!("chcp 65001 >nul && {}", command)
+            } else {
+                command.to_string()
+            }
+        };
+        #[cfg(not(windows))]
+        let actual_cmd = command;
+
+        cmd.args(&shell_args).arg(&actual_cmd);
 
         if let Some(dir) = working_dir {
             cmd.current_dir(dir);
@@ -108,6 +121,10 @@ impl CommandExecutor {
         // 抑制 macOS 终端会话恢复（zsh -i 触发）
         #[cfg(target_os = "macos")]
         cmd.env("SHELL_SESSION_DID_INIT", "1");
+
+        // Windows 上强制 Python 子进程使用 UTF-8 输出
+        #[cfg(windows)]
+        cmd.env("PYTHONIOENCODING", "utf-8");
 
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
