@@ -37,9 +37,10 @@ class WorkspaceReleaseService(Service):
 
 
 class WorkspaceReleaseComponent(Component):
-    name = 'Workspace Release'
+    name = '释放工作空间'
     code = 'workspace_release'
     bound_service = WorkspaceReleaseService
     version = '1.0'
     category = 'ClientAgent'
+    icon = "Computer"
     description = '释放工作空间'

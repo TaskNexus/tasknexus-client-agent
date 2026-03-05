@@ -257,9 +257,10 @@ class WorkspaceAcquireService(Service):
 
 
 class WorkspaceAcquireComponent(Component):
-    name = 'Workspace Acquire'
+    name = '获取工作空间'
     code = 'workspace_acquire'
     bound_service = WorkspaceAcquireService
     version = '1.0'
     category = 'ClientAgent'
+    icon = "Computer"
     description = '获取并锁定工作空间，并克隆/更新代码仓库'

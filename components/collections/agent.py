@@ -197,9 +197,10 @@ class ClientAgentService(Service):
         ]
 
 class ClientAgentComponent(Component):
-    name = 'Client Agent'
+    name = '客户端代理'
     code = 'client_agent'
     bound_service = ClientAgentService
     version = '1.3'
     category = 'ClientAgent'
+    icon = "Computer"
     description = '将脚本分发给客户端代理执行'
