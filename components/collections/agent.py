@@ -1,9 +1,12 @@
 import logging
+import json
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 from django.utils import timezone
 from pipeline.component_framework.component import Component
 from pipeline.core.flow.activity import Service, StaticIntervalGenerator
+from pipeline.core.flow.io import StringItemSchema, ObjectItemSchema
+from components.schemas import ExtendedArraySchema
 
 logger = logging.getLogger('django')
 
@@ -12,6 +15,39 @@ MAX_WAIT_FOR_AGENT = 600  # 10 minutes
 class ClientAgentService(Service):
     __need_schedule__ = True
     interval = StaticIntervalGenerator(2)
+
+    @staticmethod
+    def _normalize_env_parameters(raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+            if not raw_value:
+                return {}
+            try:
+                raw_value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                return {}
+
+        normalized = {}
+
+        if isinstance(raw_value, dict):
+            for key, value in raw_value.items():
+                key = str(key).strip()
+                if not key:
+                    continue
+                normalized[key] = '' if value is None else str(value)
+            return normalized
+
+        if isinstance(raw_value, list):
+            for item in raw_value:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get('key', '')).strip()
+                if not key:
+                    continue
+                value = item.get('value', '')
+                normalized[key] = '' if value is None else str(value)
+
+        return normalized
     
     def execute(self, data, parent_data):
         from client_agents.models import ClientAgent, AgentWorkspace
@@ -20,6 +56,7 @@ class ClientAgentService(Service):
         workspace_id = data.get_one_of_inputs('workspace_id')
         command = data.get_one_of_inputs('command', '')
         timeout = data.get_one_of_inputs('timeout', 3600)
+        parameters = data.get_one_of_inputs('parameters', [])
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         project_id = parent_data.get_one_of_inputs('project_id', '')
         
@@ -47,6 +84,7 @@ class ClientAgentService(Service):
         data.set_outputs('_client_repo_url', client_repo_url)
         data.set_outputs('_client_repo_ref', client_repo_ref)
         data.set_outputs('_client_repo_token', client_repo_token)
+        data.set_outputs('_parameters', self._normalize_env_parameters(parameters))
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         
         try:
@@ -68,6 +106,9 @@ class ClientAgentService(Service):
         client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
         client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
         client_repo_token = data.get_one_of_outputs('_client_repo_token', '')
+        task_parameters = self._normalize_env_parameters(data.get_one_of_outputs('_parameters', {}))
+        base_environment = self._normalize_env_parameters(agent.environment)
+        merged_environment = {**base_environment, **task_parameters}
         
         try:
             agent_task = AgentTask.objects.create(
@@ -100,7 +141,7 @@ class ClientAgentService(Service):
                     "client_repo_token": client_repo_token,
                     "command": command,
                     "timeout": timeout,
-                    "environment": agent.environment,
+                    "environment": merged_environment,
                 }
             )
             return True
@@ -186,6 +227,23 @@ class ClientAgentService(Service):
             self.InputItem(name='Workspace ID', key='workspace_id', type='int', required=True),
             self.InputItem(name='Script Path', key='command', type='string', required=True),
             self.InputItem(name='Timeout (s)', key='timeout', type='int', required=False),
+            self.InputItem(
+                name='Parameters',
+                key='parameters',
+                type='list',
+                required=False,
+                schema=ExtendedArraySchema(
+                    item_schema=ObjectItemSchema(
+                        property_schemas={
+                            'key': StringItemSchema(description='Environment variable key'),
+                            'value': StringItemSchema(description='Environment variable value'),
+                        },
+                        description='Environment variable pair',
+                    ),
+                    description='Additional environment variables for this task',
+                    param_type='key_values',
+                ),
+            ),
         ]
 
     def outputs_format(self):
