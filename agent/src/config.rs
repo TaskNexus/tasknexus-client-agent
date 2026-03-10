@@ -4,6 +4,7 @@
 
 use crate::error::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use sysinfo::System;
@@ -39,6 +40,15 @@ pub struct AgentConfig {
     /// 默认任务超时(秒)
     pub task_timeout: u64,
 
+    /// HTTP 代理
+    pub http_proxy: Option<String>,
+
+    /// HTTPS 代理
+    pub https_proxy: Option<String>,
+
+    /// 不走代理的地址列表
+    pub no_proxy: Option<String>,
+
     /// 开机自启动配置
     pub autostart: AutostartConfig,
 }
@@ -68,6 +78,9 @@ impl Default for AgentConfig {
             reconnect_interval: 5,
             max_reconnect_attempts: -1,
             task_timeout: 3600,
+            http_proxy: None,
+            https_proxy: None,
+            no_proxy: None,
             autostart: AutostartConfig::default(),
         }
     }
@@ -101,6 +114,15 @@ impl AgentConfig {
             if let Ok(val) = interval.parse() {
                 config.heartbeat_interval = val;
             }
+        }
+        if let Ok(proxy) = std::env::var("HTTP_PROXY") {
+            config.http_proxy = Some(proxy);
+        }
+        if let Ok(proxy) = std::env::var("HTTPS_PROXY") {
+            config.https_proxy = Some(proxy);
+        }
+        if let Ok(proxy) = std::env::var("NO_PROXY") {
+            config.no_proxy = Some(proxy);
         }
 
         config
@@ -151,6 +173,28 @@ impl AgentConfig {
     /// 获取工作空间路径
     pub fn get_workspace_path(&self, workspace_name: &str) -> PathBuf {
         self.workspaces_path.join(workspace_name)
+    }
+
+    /// 获取需要注入任务环境的代理变量
+    pub fn proxy_env(&self) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+
+        if let Some(proxy) = &self.http_proxy {
+            env.insert("HTTP_PROXY".to_string(), proxy.clone());
+            env.insert("http_proxy".to_string(), proxy.clone());
+        }
+
+        if let Some(proxy) = &self.https_proxy {
+            env.insert("HTTPS_PROXY".to_string(), proxy.clone());
+            env.insert("https_proxy".to_string(), proxy.clone());
+        }
+
+        if let Some(proxy) = &self.no_proxy {
+            env.insert("NO_PROXY".to_string(), proxy.clone());
+            env.insert("no_proxy".to_string(), proxy.clone());
+        }
+
+        env
     }
 }
 

@@ -79,7 +79,7 @@ struct Agent {
 
 impl Agent {
     fn new(config: AgentConfig) -> Self {
-        let task_runner = TaskRunner::new(config.workspaces_path.clone());
+        let task_runner = TaskRunner::new(config.workspaces_path.clone(), config.proxy_env());
         let client = AgentClient::new(config.clone());
 
         Self {

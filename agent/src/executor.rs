@@ -346,16 +346,18 @@ impl CommandExecutor {
 pub struct TaskRunner {
     workspaces_path: PathBuf,
     executor: CommandExecutor,
+    base_env: HashMap<String, String>,
 }
 
 impl TaskRunner {
-    pub fn new(workspaces_path: PathBuf) -> Self {
+    pub fn new(workspaces_path: PathBuf, base_env: HashMap<String, String>) -> Self {
         // 确保工作目录存在
         let _ = std::fs::create_dir_all(&workspaces_path);
 
         Self {
             workspaces_path,
             executor: CommandExecutor::new(3600),
+            base_env,
         }
     }
 
@@ -458,11 +460,11 @@ impl TaskRunner {
         info!("Resolved command: {}", actual_command);
 
         // 设置环境变量
-        let mut task_env = HashMap::new();
+        let mut task_env = self.base_env.clone();
         task_env.insert("TASKNEXUS_TASK_ID".to_string(), task_id.to_string());
         task_env.insert("TASKNEXUS_WORKSPACE".to_string(), workspace_name.to_string());
 
-        // 合并用户自定义环境变量
+        // 合并任务自定义环境变量，允许覆盖默认代理配置
         if let Some(env) = environment {
             task_env.extend(env);
         }
@@ -547,7 +549,7 @@ impl TaskRunner {
 
         info!("Cloning: {} (in {:?})", repo_url, target_path.parent());
 
-        let mut env = HashMap::new();
+        let mut env = self.base_env.clone();
         env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
 
         self.executor
@@ -583,7 +585,7 @@ impl TaskRunner {
             auth_url, ref_name
         );
 
-        let mut env = HashMap::new();
+        let mut env = self.base_env.clone();
         env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
 
         self.executor

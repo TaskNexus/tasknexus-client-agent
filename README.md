@@ -49,6 +49,11 @@ log_level: INFO
 heartbeat_interval: 30
 reconnect_interval: 5
 
+# 代理配置（可选）
+# http_proxy: http://127.0.0.1:7890
+# https_proxy: http://127.0.0.1:7890
+# no_proxy: localhost,127.0.0.1,.internal.example.com
+
 # 开机自启动
 autostart:
   enabled: true
@@ -56,6 +61,8 @@ autostart:
 ```
 
 所有配置均通过配置文件管理，不支持命令行参数覆盖。
+
+配置了 `http_proxy` / `https_proxy` / `no_proxy` 后，Agent 会在执行任务命令以及 `git clone` / `git fetch` 时自动注入 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 以及对应的小写环境变量。
 
 ### 开机自启动
 
