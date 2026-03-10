@@ -181,6 +181,7 @@ class ClientAgentService(Service):
             data.set_outputs('exit_code', task.exit_code if task.exit_code is not None else -1)
             data.set_outputs('stdout', task.stdout)
             data.set_outputs('stderr', task.stderr)
+            data.set_outputs('result', task.result if isinstance(task.result, dict) else {})
             data.outputs.ex_data = task.error_message
             self.finish_schedule()
             return status == 'COMPLETED'
@@ -252,6 +253,15 @@ class ClientAgentService(Service):
             self.OutputItem(name='Exit Code', key='exit_code', type='int'),
             self.OutputItem(name='Standard Output', key='stdout', type='string'),
             self.OutputItem(name='Standard Error', key='stderr', type='string'),
+            self.OutputItem(
+                name='Result',
+                key='result',
+                type='object',
+                schema=ObjectItemSchema(
+                    property_schemas={},
+                    description='Structured task result for splice access, e.g. ${result["file_name"]}',
+                ),
+            ),
         ]
 
 class ClientAgentComponent(Component):
