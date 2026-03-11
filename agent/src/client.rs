@@ -61,7 +61,7 @@ pub enum ClientMessage {
     Heartbeat { system_info: SystemInfo },
     TaskStarted { task_id: i64 },
     TaskProgress { task_id: i64, output: String },
-    TaskCompleted { task_id: i64, exit_code: i32, stdout: String, stderr: String },
+    TaskCompleted { task_id: i64, exit_code: i32, stdout: String, stderr: String, result: HashMap<String, serde_json::Value> },
     TaskFailed { task_id: i64, error: String },
     TaskHeartbeat { task_id: i64 },
 }
@@ -143,12 +143,14 @@ impl AgentClient {
         exit_code: i32,
         stdout: String,
         stderr: String,
+        result: HashMap<String, serde_json::Value>,
     ) -> Result<()> {
         self.send_message(ClientMessage::TaskCompleted {
             task_id,
             exit_code,
             stdout,
             stderr,
+            result,
         }).await
     }
 

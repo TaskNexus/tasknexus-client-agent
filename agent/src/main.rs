@@ -250,6 +250,7 @@ impl Agent {
                 result.exit_code,
                 result.stdout,
                 result.stderr,
+                result.result,
             ).await {
                 error!("Failed to send task completed: {}", e);
             }
@@ -268,6 +269,7 @@ impl Agent {
                     result.exit_code,
                     result.stdout,
                     result.stderr,
+                    result.result,
                 ).await {
                     error!("Failed to send task completed: {}", e);
                 }

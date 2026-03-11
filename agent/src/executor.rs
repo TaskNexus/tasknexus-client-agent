@@ -11,6 +11,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
+/// Magic markers for structured result extraction from stdout
+const RESULT_BEGIN_MARKER: &str = "##TASKNEXUS_RESULT_BEGIN##";
+const RESULT_END_MARKER: &str = "##TASKNEXUS_RESULT_END##";
+
 /// 杀死进程及其所有子进程
 async fn kill_process_tree(child: &mut Child) {
     let pid = match child.id() {
@@ -52,6 +56,46 @@ pub struct ExecutionResult {
     pub stderr: String,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// Structured result extracted from stdout via magic markers.
+    pub result: HashMap<String, serde_json::Value>,
+}
+
+/// Extract structured result JSON from stdout between magic markers.
+///
+/// Returns ``(cleaned_stdout, result_map)``.
+/// If no markers are found the stdout is returned unchanged and the map is empty.
+fn extract_result(raw_stdout: &str) -> (String, HashMap<String, serde_json::Value>) {
+    let begin = raw_stdout.find(RESULT_BEGIN_MARKER);
+    let end = raw_stdout.find(RESULT_END_MARKER);
+
+    if let (Some(b), Some(e)) = (begin, end) {
+        if b < e {
+            let json_start = b + RESULT_BEGIN_MARKER.len();
+            let json_str = raw_stdout[json_start..e].trim();
+
+            let result: HashMap<String, serde_json::Value> = match serde_json::from_str(json_str) {
+                Ok(map) => map,
+                Err(err) => {
+                    warn!("Failed to parse result JSON: {}", err);
+                    HashMap::new()
+                }
+            };
+
+            // Strip the marker block (including surrounding newlines) from stdout
+            let before = raw_stdout[..b].trim_end_matches('\n');
+            let after_end = e + RESULT_END_MARKER.len();
+            let after = raw_stdout[after_end..].trim_start_matches('\n');
+            let cleaned = if after.is_empty() {
+                before.to_string()
+            } else {
+                format!("{}\n{}", before, after)
+            };
+
+            return (cleaned, result);
+        }
+    }
+
+    (raw_stdout.to_string(), HashMap::new())
 }
 
 /// 命令执行器
@@ -192,6 +236,7 @@ impl CommandExecutor {
                     stderr: e.to_string(),
                     timed_out: false,
                     cancelled: false,
+                    result: HashMap::new(),
                 };
             }
         };
@@ -277,12 +322,15 @@ impl CommandExecutor {
                             let exit_code = status
                                 .map(|s| s.code().unwrap_or(-1))
                                 .unwrap_or(-1);
+                            let raw_stdout = stdout_lines.join("\n");
+                            let (stdout, result) = extract_result(&raw_stdout);
                             ExecutionResult {
                                 exit_code,
-                                stdout: stdout_lines.join("\n"),
+                                stdout,
                                 stderr: stderr_lines.join("\n"),
                                 timed_out: false,
                                 cancelled: false,
+                                result,
                             }
                         }
                         Err(_) => {
@@ -294,6 +342,7 @@ impl CommandExecutor {
                                 stderr: format!("Command timed out after {} seconds", timeout_secs),
                                 timed_out: true,
                                 cancelled: false,
+                                result: HashMap::new(),
                             }
                         }
                     }
@@ -307,6 +356,7 @@ impl CommandExecutor {
                         stderr: "Task was cancelled".to_string(),
                         timed_out: false,
                         cancelled: true,
+                        result: HashMap::new(),
                     }
                 }
             }
@@ -318,12 +368,15 @@ impl CommandExecutor {
                     let exit_code = status
                         .map(|s| s.code().unwrap_or(-1))
                         .unwrap_or(-1);
+                    let raw_stdout = stdout_lines.join("\n");
+                    let (stdout, result) = extract_result(&raw_stdout);
                     ExecutionResult {
                         exit_code,
-                        stdout: stdout_lines.join("\n"),
+                        stdout,
                         stderr: stderr_lines.join("\n"),
                         timed_out: false,
                         cancelled: false,
+                        result,
                     }
                 }
                 Err(_) => {
@@ -335,6 +388,7 @@ impl CommandExecutor {
                         stderr: format!("Command timed out after {} seconds", timeout_secs),
                         timed_out: true,
                         cancelled: false,
+                        result: HashMap::new(),
                     }
                 }
             }
@@ -398,6 +452,7 @@ impl TaskRunner {
                 stderr: format!("Failed to create workspace directory: {}", e),
                 timed_out: false,
                 cancelled: false,
+                result: HashMap::new(),
             };
         }
 
@@ -445,6 +500,7 @@ impl TaskRunner {
                 stderr: String::new(),
                 timed_out: false,
                 cancelled: false,
+                result: HashMap::new(),
             };
         }
 
