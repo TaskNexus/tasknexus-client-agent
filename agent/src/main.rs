@@ -19,6 +19,38 @@ use tasknexus_agent::{
     autostart::AutoStartManager,
 };
 
+const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
+
+fn split_log_chunks(input: &str, max_chunk_bytes: usize) -> Vec<String> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let total_len = input.len();
+
+    while start < total_len {
+        let mut end = std::cmp::min(start + max_chunk_bytes, total_len);
+        while end > start && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+
+        if end == start {
+            if let Some((offset, _)) = input[start..].char_indices().nth(1) {
+                end = start + offset;
+            } else {
+                end = total_len;
+            }
+        }
+
+        chunks.push(input[start..end].to_string());
+        start = end;
+    }
+
+    chunks
+}
+
 /// TaskNexus Agent - 客户端代理
 #[derive(Parser, Debug)]
 #[command(name = "tasknexus-agent")]
@@ -207,7 +239,9 @@ impl Agent {
                     let batch = buf.join("\n");
                     buf.clear();
                     drop(buf); // 释放锁再 await
-                    let _ = flush_client.send_task_progress(task_id, batch).await;
+                    for chunk in split_log_chunks(&batch, MAX_LOG_CHUNK_BYTES) {
+                        let _ = flush_client.send_task_progress(task_id, chunk).await;
+                    }
                 }
             }
         });
@@ -237,7 +271,9 @@ impl Agent {
                 let batch = buf.join("\n");
                 buf.clear();
                 drop(buf);
-                let _ = self.client.send_task_progress(task_id, batch).await;
+                for chunk in split_log_chunks(&batch, MAX_LOG_CHUNK_BYTES) {
+                    let _ = self.client.send_task_progress(task_id, chunk).await;
+                }
             }
         }
 

@@ -86,7 +86,8 @@ pub struct AgentClient {
     connected: Arc<RwLock<bool>>,
     running: Arc<RwLock<bool>>,
     reconnect_attempts: Arc<RwLock<u32>>,
-    sender: Arc<RwLock<Option<mpsc::Sender<ClientMessage>>>>,
+    control_sender: Arc<RwLock<Option<mpsc::Sender<ClientMessage>>>>,
+    log_sender: Arc<RwLock<Option<mpsc::Sender<ClientMessage>>>>,
 }
 
 impl AgentClient {
@@ -96,7 +97,8 @@ impl AgentClient {
             connected: Arc::new(RwLock::new(false)),
             running: Arc::new(RwLock::new(false)),
             reconnect_attempts: Arc::new(RwLock::new(0)),
-            sender: Arc::new(RwLock::new(None)),
+            control_sender: Arc::new(RwLock::new(None)),
+            log_sender: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -107,23 +109,44 @@ impl AgentClient {
         Url::parse(&url_str).map_err(AgentError::from)
     }
 
+    async fn send_control_message(&self, message: ClientMessage) -> Result<()> {
+        let sender = self.control_sender.read().await;
+        if let Some(tx) = sender.as_ref() {
+            tx.send(message)
+                .await
+                .map_err(|e| AgentError::Connection(format!("Failed to send control message: {}", e)))?;
+            return Ok(());
+        }
+        warn!("Cannot send control message: not connected");
+        Ok(())
+    }
+
+    async fn send_log_message(&self, message: ClientMessage) -> Result<()> {
+        let sender = self.log_sender.read().await;
+        if let Some(tx) = sender.as_ref() {
+            tx.send(message)
+                .await
+                .map_err(|e| AgentError::Connection(format!("Failed to send log message: {}", e)))?;
+            return Ok(());
+        }
+        warn!("Cannot send log message: not connected");
+        Ok(())
+    }
+
     /// 发送消息到服务器
     pub async fn send_message(&self, message: ClientMessage) -> Result<()> {
-        let sender = self.sender.read().await;
-        if let Some(tx) = sender.as_ref() {
-            tx.send(message).await.map_err(|e| {
-                AgentError::Connection(format!("Failed to send message: {}", e))
-            })?;
+        if matches!(message, ClientMessage::TaskProgress { .. }) {
+            self.send_log_message(message).await
         } else {
-            warn!("Cannot send message: not connected");
+            self.send_control_message(message).await
         }
-        Ok(())
     }
 
     /// 发送心跳
     pub async fn send_heartbeat(&self) -> Result<()> {
         let system_info = self.config.get_system_info();
-        self.send_message(ClientMessage::Heartbeat { system_info }).await
+        self.send_control_message(ClientMessage::Heartbeat { system_info })
+            .await
     }
 
     /// 发送任务开始通知
@@ -133,7 +156,8 @@ impl AgentClient {
 
     /// 发送任务进度更新
     pub async fn send_task_progress(&self, task_id: i64, output: String) -> Result<()> {
-        self.send_message(ClientMessage::TaskProgress { task_id, output }).await
+        self.send_log_message(ClientMessage::TaskProgress { task_id, output })
+            .await
     }
 
     /// 发送任务完成通知
@@ -161,7 +185,8 @@ impl AgentClient {
 
     /// 发送任务心跳
     pub async fn send_task_heartbeat(&self, task_id: i64) -> Result<()> {
-        self.send_message(ClientMessage::TaskHeartbeat { task_id }).await
+        self.send_control_message(ClientMessage::TaskHeartbeat { task_id })
+            .await
     }
 
     /// 运行客户端主循环
@@ -181,88 +206,65 @@ impl AgentClient {
         *self.running.write().await = true;
 
         while *self.running.read().await {
-            // 尝试连接
-            if !*self.connected.read().await {
-                match self.connect().await {
-                    Ok(_) => {
-                        *self.reconnect_attempts.write().await = 0;
-                        on_connected();
+            match self
+                .message_loop(on_task_dispatch.clone(), on_task_cancel.clone(), &on_connected)
+                .await
+            {
+                Ok(_) => {
+                    *self.reconnect_attempts.write().await = 0;
+                    let was_connected = *self.connected.read().await;
+                    *self.connected.write().await = false;
+                    *self.control_sender.write().await = None;
+                    *self.log_sender.write().await = None;
+
+                    if was_connected {
+                        on_disconnected();
                     }
-                    Err(e) => {
-                        error!("Failed to connect: {}", e);
-                        *self.reconnect_attempts.write().await += 1;
 
-                        let attempts = *self.reconnect_attempts.read().await;
-                        if self.config.max_reconnect_attempts > 0
-                            && attempts >= self.config.max_reconnect_attempts as u32
-                        {
-                            error!("Max reconnect attempts reached, giving up");
-                            break;
-                        }
-
-                        let wait_time = std::cmp::min(
-                            self.config.reconnect_interval * 2u64.pow(std::cmp::min(attempts, 5)),
-                            60,
-                        );
-                        info!("Reconnecting in {} seconds... (attempt {})", wait_time, attempts);
-                        tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                        continue;
+                    if *self.running.read().await {
+                        warn!("Connection lost, will reconnect...");
+                        tokio::time::sleep(Duration::from_secs(self.config.reconnect_interval)).await;
                     }
                 }
-            }
+                Err(e) => {
+                    error!("Connection/message loop error: {}", e);
+                    let was_connected = *self.connected.read().await;
+                    *self.connected.write().await = false;
+                    *self.control_sender.write().await = None;
+                    *self.log_sender.write().await = None;
+                    if was_connected {
+                        on_disconnected();
+                    }
 
-            // 运行消息循环
-            if let Err(e) = self.message_loop(on_task_dispatch.clone(), on_task_cancel.clone()).await {
-                error!("Message loop error: {}", e);
-            }
+                    *self.reconnect_attempts.write().await += 1;
+                    let attempts = *self.reconnect_attempts.read().await;
+                    if self.config.max_reconnect_attempts > 0
+                        && attempts >= self.config.max_reconnect_attempts as u32
+                    {
+                        error!("Max reconnect attempts reached, giving up");
+                        break;
+                    }
 
-            *self.connected.write().await = false;
-            on_disconnected();
-
-            if *self.running.read().await {
-                warn!("Connection lost, will reconnect...");
-                tokio::time::sleep(Duration::from_secs(self.config.reconnect_interval)).await;
+                    let wait_time = std::cmp::min(
+                        self.config.reconnect_interval * 2u64.pow(std::cmp::min(attempts, 5)),
+                        60,
+                    );
+                    info!("Reconnecting in {} seconds... (attempt {})", wait_time, attempts);
+                    tokio::time::sleep(Duration::from_secs(wait_time)).await;
+                }
             }
         }
 
         Ok(())
     }
 
-    /// 连接到服务器
-    async fn connect(&self) -> Result<()> {
-        let url = self.ws_url()?;
-        info!("Connecting to {}...", self.config.server);
-
-        let (ws_stream, _) = connect_async(url.as_str()).await?;
-        info!("Connected to server successfully");
-
-        let (write, read) = ws_stream.split();
-
-        // 创建消息发送通道
-        let (tx, mut rx) = mpsc::channel::<ClientMessage>(100);
-        *self.sender.write().await = Some(tx);
-        *self.connected.write().await = true;
-
-        // 消息发送任务
-        let write = Arc::new(tokio::sync::Mutex::new(write));
-        let write_clone = write.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let mut w = write_clone.lock().await;
-                    if let Err(e) = w.send(Message::Text(json)).await {
-                        error!("Failed to send message: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(())
-    }
-
     /// 消息接收循环
-    async fn message_loop<F, G, Fut1, Fut2>(&self, on_task_dispatch: F, on_task_cancel: G) -> Result<()>
+    async fn message_loop<F, G, Fut1, Fut2>(
+        &self,
+        on_task_dispatch: F,
+        on_task_cancel: G,
+        on_connected: &(dyn Fn() + Send + Sync),
+    ) -> Result<()>
     where
         F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + Clone + 'static,
         Fut1: std::future::Future<Output = ()> + Send + 'static,
@@ -270,38 +272,94 @@ impl AgentClient {
         Fut2: std::future::Future<Output = ()> + Send,
     {
         let url = self.ws_url()?;
+        info!("Connecting to {}...", self.config.server);
         let (ws_stream, _) = connect_async(url.as_str()).await?;
+        info!("Connected to server successfully");
+        *self.connected.write().await = true;
+        on_connected();
+
         let (write, mut read) = ws_stream.split();
 
-        // 创建消息发送通道
-        let (tx, mut rx) = mpsc::channel::<ClientMessage>(100);
-        *self.sender.write().await = Some(tx.clone());
+        // 控制/日志分队列，控制消息优先发送
+        let (control_tx, mut control_rx) = mpsc::channel::<ClientMessage>(100);
+        let (log_tx, mut log_rx) = mpsc::channel::<ClientMessage>(100);
+        *self.control_sender.write().await = Some(control_tx.clone());
+        *self.log_sender.write().await = Some(log_tx);
 
         // 消息发送任务
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let write_clone = write.clone();
         let send_task = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let mut w = write_clone.lock().await;
-                    if let Err(e) = w.send(Message::Text(json)).await {
-                        error!("Failed to send message: {}", e);
-                        break;
+            let mut control_closed = false;
+            let mut log_closed = false;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    msg = control_rx.recv(), if !control_closed => {
+                        match msg {
+                            Some(msg) => {
+                                match serde_json::to_string(&msg) {
+                                    Ok(json) => {
+                                        let mut w = write_clone.lock().await;
+                                        if let Err(e) = w.send(Message::Text(json)).await {
+                                            error!("Failed to send control message: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to serialize control message: {}", e);
+                                    }
+                                }
+                            }
+                            None => {
+                                control_closed = true;
+                            }
+                        }
                     }
+                    msg = log_rx.recv(), if !log_closed => {
+                        match msg {
+                            Some(msg) => {
+                                match serde_json::to_string(&msg) {
+                                    Ok(json) => {
+                                        let mut w = write_clone.lock().await;
+                                        if let Err(e) = w.send(Message::Text(json)).await {
+                                            error!("Failed to send log message: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to serialize log message: {}", e);
+                                    }
+                                }
+                            }
+                            None => {
+                                log_closed = true;
+                            }
+                        }
+                    }
+                }
+
+                if control_closed && log_closed {
+                    break;
                 }
             }
         });
 
-        // 心跳任务
+        // agent 心跳任务（控制队列）
         let heartbeat_interval = self.config.heartbeat_interval;
-        let tx_heartbeat = tx.clone();
+        let control_tx_heartbeat = control_tx.clone();
         let config_clone = self.config.clone();
         let heartbeat_task = tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(heartbeat_interval));
+            let mut ticker = interval(Duration::from_secs(heartbeat_interval));
             loop {
-                interval.tick().await;
+                ticker.tick().await;
                 let system_info = config_clone.get_system_info();
-                if tx_heartbeat.send(ClientMessage::Heartbeat { system_info }).await.is_err() {
+                if control_tx_heartbeat
+                    .send(ClientMessage::Heartbeat { system_info })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -339,7 +397,8 @@ impl AgentClient {
         // 清理
         heartbeat_task.abort();
         send_task.abort();
-        *self.sender.write().await = None;
+        *self.control_sender.write().await = None;
+        *self.log_sender.write().await = None;
 
         Ok(())
     }

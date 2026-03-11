@@ -11,6 +11,8 @@ from components.schemas import ExtendedArraySchema
 logger = logging.getLogger('django')
 
 MAX_WAIT_FOR_AGENT = 600  # 10 minutes
+HEARTBEAT_TIMEOUT_SECONDS = 120
+HEARTBEAT_TIMEOUT_RETRY = 3
 
 class ClientAgentService(Service):
     __need_schedule__ = True
@@ -86,6 +88,8 @@ class ClientAgentService(Service):
         data.set_outputs('_client_repo_token', client_repo_token)
         data.set_outputs('_parameters', self._normalize_env_parameters(parameters))
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
+        data.set_outputs('_hb_timeout_miss_count', 0)
+        data.set_outputs('_hb_last_seen_heartbeat', '')
         
         try:
             workspace = AgentWorkspace.objects.get(id=workspace_id)
@@ -175,6 +179,8 @@ class ClientAgentService(Service):
         status = task.status
         
         if status == 'CANCELLED':
+            data.set_outputs('_hb_timeout_miss_count', 0)
+            data.set_outputs('_hb_last_seen_heartbeat', '')
             return True
         
         if status in ['COMPLETED', 'FAILED', 'TIMEOUT']:
@@ -183,22 +189,50 @@ class ClientAgentService(Service):
             data.set_outputs('stderr', task.stderr)
             data.set_outputs('result', task.result if isinstance(task.result, dict) else {})
             data.outputs.ex_data = task.error_message
+            data.set_outputs('_hb_timeout_miss_count', 0)
+            data.set_outputs('_hb_last_seen_heartbeat', '')
             self.finish_schedule()
             return status == 'COMPLETED'
         
         if status in ['DISPATCHED', 'RUNNING']:
             # Check heartbeat timeout for running tasks
-            if status == 'RUNNING' and task.last_heartbeat:
-                heartbeat_elapsed = (timezone.now() - task.last_heartbeat).total_seconds()
-                if heartbeat_elapsed > 120:  # 120 seconds heartbeat timeout
-                    AgentTask.objects.filter(id=task_id).update(
-                        status='FAILED',
-                        error_message='Task heartbeat timeout',
-                        finished_at=timezone.now()
-                    )
-                    data.outputs.ex_data = 'Task heartbeat timeout'
-                    self.finish_schedule()
-                    return False
+            if status == 'RUNNING':
+                miss_count = int(data.get_one_of_outputs('_hb_timeout_miss_count', 0) or 0)
+                last_seen_heartbeat = data.get_one_of_outputs('_hb_last_seen_heartbeat', '') or ''
+                current_heartbeat = task.last_heartbeat
+                current_heartbeat_iso = current_heartbeat.isoformat() if current_heartbeat else ''
+
+                # 心跳前进说明 agent 仍存活，先清零计数
+                if current_heartbeat_iso and current_heartbeat_iso != last_seen_heartbeat:
+                    miss_count = 0
+                    data.set_outputs('_hb_last_seen_heartbeat', current_heartbeat_iso)
+
+                if current_heartbeat:
+                    heartbeat_elapsed = (timezone.now() - current_heartbeat).total_seconds()
+                    if heartbeat_elapsed > HEARTBEAT_TIMEOUT_SECONDS:
+                        miss_count += 1
+                        data.set_outputs('_hb_timeout_miss_count', miss_count)
+                        if miss_count >= HEARTBEAT_TIMEOUT_RETRY:
+                            AgentTask.objects.filter(id=task_id).update(
+                                status='FAILED',
+                                error_message='Task heartbeat timeout',
+                                finished_at=timezone.now()
+                            )
+                            data.outputs.ex_data = 'Task heartbeat timeout'
+                            data.set_outputs('_hb_timeout_miss_count', 0)
+                            data.set_outputs('_hb_last_seen_heartbeat', '')
+                            self.finish_schedule()
+                            return False
+                    else:
+                        # 未超时则立即恢复
+                        if miss_count != 0:
+                            miss_count = 0
+                        data.set_outputs('_hb_timeout_miss_count', miss_count)
+                else:
+                    # 尚无心跳，不累计失败次数
+                    if miss_count != 0:
+                        miss_count = 0
+                    data.set_outputs('_hb_timeout_miss_count', miss_count)
             
             dispatch_time_str = data.get_one_of_outputs('_dispatch_time')
             timeout = data.get_one_of_outputs('_timeout', 3600)
@@ -216,6 +250,8 @@ class ClientAgentService(Service):
                         )
                         
                         data.outputs.ex_data = f'Task timed out after {timeout} seconds'
+                        data.set_outputs('_hb_timeout_miss_count', 0)
+                        data.set_outputs('_hb_last_seen_heartbeat', '')
                         self.finish_schedule()
                         return False
                 except (ValueError, TypeError):
