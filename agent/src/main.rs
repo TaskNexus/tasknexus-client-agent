@@ -105,8 +105,8 @@ struct Agent {
     config: AgentConfig,
     task_runner: TaskRunner,
     client: AgentClient,
-    /// Maps workspace_name -> (task_id, cancel_sender)
-    running_tasks: Arc<RwLock<HashMap<String, (i64, watch::Sender<bool>)>>>,
+    /// Maps task_id -> (workspace_name, cancel_sender)
+    running_tasks: Arc<RwLock<HashMap<i64, (String, watch::Sender<bool>)>>>,
 }
 
 impl Agent {
@@ -165,21 +165,14 @@ impl Agent {
             task_id, workspace_name, command
         );
 
-        // 检查该 workspace 是否已有运行中的任务
+        // 防止重复分发同一个 task_id（例如重试场景）
         {
             let running = self.running_tasks.read().await;
-            if let Some((existing_task_id, _)) = running.get(&workspace_name) {
+            if running.contains_key(&task_id) {
                 warn!(
-                    "Workspace '{}' already running task {}, rejecting new task",
-                    workspace_name, existing_task_id
+                    "Task {} is already running, ignore duplicate dispatch",
+                    task_id
                 );
-                let _ = self.client.send_task_failed(
-                    task_id,
-                    format!(
-                        "Workspace '{}' is busy running task {}",
-                        workspace_name, existing_task_id
-                    ),
-                ).await;
                 return;
             }
         }
@@ -188,7 +181,10 @@ impl Agent {
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         // 标记任务正在运行
-        self.running_tasks.write().await.insert(workspace_name.clone(), (task_id, cancel_tx));
+        self.running_tasks
+            .write()
+            .await
+            .insert(task_id, (workspace_name.clone(), cancel_tx));
 
         // 通知任务开始
         if let Err(e) = self.client.send_task_started(task_id).await {
@@ -314,18 +310,16 @@ impl Agent {
         }
 
         // 移除运行中的任务
-        self.running_tasks.write().await.remove(&workspace_name);
+        self.running_tasks.write().await.remove(&task_id);
     }
 
     async fn handle_task_cancel(&self, task_id: i64) {
         info!("Processing cancel for task {}", task_id);
         let running = self.running_tasks.read().await;
-        for (workspace_name, (tid, cancel_tx)) in running.iter() {
-            if *tid == task_id {
-                info!("Sending cancel signal to task {} in workspace '{}'", task_id, workspace_name);
-                let _ = cancel_tx.send(true);
-                return;
-            }
+        if let Some((workspace_name, cancel_tx)) = running.get(&task_id) {
+            info!("Sending cancel signal to task {} in workspace '{}'", task_id, workspace_name);
+            let _ = cancel_tx.send(true);
+            return;
         }
         warn!("Task {} not found in running tasks, cannot cancel", task_id);
     }

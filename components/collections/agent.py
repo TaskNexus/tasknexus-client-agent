@@ -1,12 +1,11 @@
 import logging
 import json
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync
 from django.utils import timezone
 from pipeline.component_framework.component import Component
 from pipeline.core.flow.activity import Service, StaticIntervalGenerator
 from pipeline.core.flow.io import StringItemSchema, ObjectItemSchema
 from components.schemas import ExtendedArraySchema
+from client_agents.dispatch_stream import publish_dispatch_event
 
 logger = logging.getLogger('django')
 
@@ -121,8 +120,7 @@ class ClientAgentService(Service):
                 pipeline_id=pipeline_id,
                 command=command,
                 timeout=timeout,
-                status='DISPATCHED',
-                dispatched_at=timezone.now(),
+                status='PENDING',
             )
             task_id = agent_task.id
             
@@ -133,10 +131,10 @@ class ClientAgentService(Service):
             return False
         
         try:
-            channel_layer = get_channel_layer()
-            async_to_sync(channel_layer.group_send)(
-                f"agent_{agent.id}",
-                {
+            publish_dispatch_event(
+                task_id=task_id,
+                agent_id=agent.id,
+                payload={
                     "type": "task_dispatch",
                     "task_id": task_id,
                     "workspace_name": workspace.name,
@@ -146,7 +144,7 @@ class ClientAgentService(Service):
                     "command": command,
                     "timeout": timeout,
                     "environment": merged_environment,
-                }
+                },
             )
             return True
             
@@ -194,7 +192,7 @@ class ClientAgentService(Service):
             self.finish_schedule()
             return status == 'COMPLETED'
         
-        if status in ['DISPATCHED', 'RUNNING']:
+        if status in ['PENDING', 'DISPATCHED', 'RUNNING']:
             # Check heartbeat timeout for running tasks
             if status == 'RUNNING':
                 miss_count = int(data.get_one_of_outputs('_hb_timeout_miss_count', 0) or 0)

@@ -1,10 +1,9 @@
 import logging
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync
 from django.db import transaction
 from django.utils import timezone
 from pipeline.component_framework.component import Component
 from pipeline.core.flow.activity import Service, StaticIntervalGenerator
+from client_agents.dispatch_stream import publish_dispatch_event
 
 logger = logging.getLogger('django')
 
@@ -123,8 +122,7 @@ class WorkspaceAcquireService(Service):
                 client_repo_ref=client_repo_ref,
                 command=clone_command,
                 timeout=300,  # 5 minutes for clone
-                status='DISPATCHED',
-                dispatched_at=timezone.now(),
+                status='PENDING',
             )
             data.set_outputs('_clone_task_id', agent_task.id)
         except Exception as e:
@@ -132,10 +130,10 @@ class WorkspaceAcquireService(Service):
             return False
 
         try:
-            channel_layer = get_channel_layer()
-            async_to_sync(channel_layer.group_send)(
-                f"agent_{agent.id}",
-                {
+            publish_dispatch_event(
+                task_id=agent_task.id,
+                agent_id=agent.id,
+                payload={
                     "type": "task_dispatch",
                     "task_id": agent_task.id,
                     "workspace_name": workspace.name,
@@ -145,7 +143,7 @@ class WorkspaceAcquireService(Service):
                     "command": clone_command,
                     "timeout": 300,
                     "environment": agent.environment,
-                }
+                },
             )
             return True
         except Exception as e:
