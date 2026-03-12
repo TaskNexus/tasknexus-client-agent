@@ -253,10 +253,8 @@ fn launch_updater(updater_path: &Path, new_agent_path: &Path, config_path: &Path
         .arg(&current_exe)
         .arg("--new-exe")
         .arg(new_agent_path)
-        .arg("--restart-arg")
-        .arg("--config")
-        .arg("--restart-arg")
-        .arg(config_path);
+        .arg("--restart-arg=--config")
+        .arg(format!("--restart-arg={}", config_path.display()));
 
     #[cfg(windows)]
     {

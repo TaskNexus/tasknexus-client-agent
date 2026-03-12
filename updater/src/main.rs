@@ -18,7 +18,7 @@ struct Cli {
     #[arg(long)]
     new_exe: PathBuf,
 
-    #[arg(long = "restart-arg")]
+    #[arg(long = "restart-arg", allow_hyphen_values = true)]
     restart_args: Vec<String>,
 
     // Backward compatibility for older agent versions that passed
