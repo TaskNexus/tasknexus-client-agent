@@ -417,6 +417,62 @@ impl TaskRunner {
         }
     }
 
+    async fn ensure_repo_ready<F, Fut>(
+        &self,
+        workspace_dir: &Path,
+        repo_name: &str,
+        repo_url: &str,
+        client_repo_ref: &str,
+        client_repo_token: Option<&str>,
+        on_output: Option<F>,
+        continue_on_update_failure: bool,
+        log_context: &str,
+    ) -> Option<ExecutionResult>
+    where
+        F: Fn(String, bool) -> Fut + Send + Clone + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let repo_path = workspace_dir.join(repo_name);
+
+        if !repo_path.exists() {
+            info!("{} (clone): {} -> {:?}", log_context, repo_url, repo_path);
+            let clone_result = self
+                .clone_repo(
+                    repo_url,
+                    &repo_path,
+                    client_repo_ref,
+                    client_repo_token,
+                    on_output,
+                )
+                .await;
+            if clone_result.exit_code != 0 {
+                return Some(clone_result);
+            }
+            return None;
+        }
+
+        info!("{} (update): {:?}", log_context, repo_path);
+        let update_result = self
+            .update_repo(
+                repo_url,
+                &repo_path,
+                client_repo_ref,
+                client_repo_token,
+                on_output,
+            )
+            .await;
+
+        if update_result.exit_code != 0 {
+            if continue_on_update_failure {
+                warn!("Failed to update repository (will continue anyway)");
+                return None;
+            }
+            return Some(update_result);
+        }
+
+        None
+    }
+
     /// 运行任务
     pub async fn run_task<F, Fut>(
         &self,
@@ -428,6 +484,8 @@ impl TaskRunner {
         client_repo_url: Option<&str>,
         client_repo_ref: &str,
         client_repo_token: Option<&str>,
+        prepare_repo_before_execute: bool,
+        cleanup_workspace_on_success: bool,
         timeout_secs: u64,
         on_output: Option<F>,
         environment: Option<HashMap<String, String>>,
@@ -491,39 +549,45 @@ impl TaskRunner {
                 .replace('-', "_")
         });
 
+        if prepare_repo_before_execute {
+            if let (Some(repo_name), Some(repo_url)) = (repo_name.as_ref(), client_repo_url) {
+                if let Some(repo_result) = self
+                    .ensure_repo_ready(
+                        &workspace_dir,
+                        repo_name,
+                        repo_url,
+                        client_repo_ref,
+                        client_repo_token,
+                        on_output.clone(),
+                        false,
+                        "Preparing repository before execution",
+                    )
+                    .await
+                {
+                    return repo_result;
+                }
+            }
+        }
+
         // command 模式下 command 为空时，执行 clone/update 后直接返回（workspace_acquire 阶段）
         if normalized_mode == "command" && command.is_empty() {
-            if let Some(ref repo_name) = repo_name {
-                if let Some(repo_url) = client_repo_url {
-                    let repo_path = workspace_dir.join(repo_name);
-
-                    if !repo_path.exists() {
-                        info!("Cloning repository {} to {:?}", repo_url, repo_path);
-                        let result = self
-                            .clone_repo(
+            if !prepare_repo_before_execute {
+                if let Some(ref repo_name) = repo_name {
+                    if let Some(repo_url) = client_repo_url {
+                        if let Some(repo_result) = self
+                            .ensure_repo_ready(
+                                &workspace_dir,
+                                repo_name,
                                 repo_url,
-                                &repo_path,
                                 client_repo_ref,
                                 client_repo_token,
                                 on_output.clone(),
+                                true,
+                                "Preparing repository for empty command",
                             )
-                            .await;
-                        if result.exit_code != 0 {
-                            return result;
-                        }
-                    } else {
-                        info!("Updating repository: {:?}", repo_path);
-                        let update_result = self
-                            .update_repo(
-                                repo_url,
-                                &repo_path,
-                                client_repo_ref,
-                                client_repo_token,
-                                on_output.clone(),
-                            )
-                            .await;
-                        if update_result.exit_code != 0 {
-                            warn!("Failed to update repository (will continue anyway)");
+                            .await
+                        {
+                            return repo_result;
                         }
                     }
                 }
@@ -651,6 +715,21 @@ impl TaskRunner {
             error!("Command failed with exit code {}", result.exit_code);
             if !result.stderr.is_empty() {
                 error!("stderr: {}", &result.stderr[..result.stderr.len().min(500)]);
+            }
+        }
+
+        if cleanup_workspace_on_success
+            && result.exit_code == 0
+            && !result.timed_out
+            && !result.cancelled
+        {
+            if let Err(e) = std::fs::remove_dir_all(&workspace_dir) {
+                warn!(
+                    "Failed to cleanup workspace directory {:?}: {}",
+                    workspace_dir, e
+                );
+            } else {
+                info!("Cleaned up workspace directory {:?}", workspace_dir);
             }
         }
 

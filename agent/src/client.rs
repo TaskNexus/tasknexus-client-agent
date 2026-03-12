@@ -56,6 +56,10 @@ pub enum ServerMessage {
         timeout: u64,
         #[serde(default)]
         environment: HashMap<String, String>,
+        #[serde(default)]
+        prepare_repo_before_execute: bool,
+        #[serde(default)]
+        cleanup_workspace_on_success: bool,
     },
     TaskCancel {
         task_id: i64,
@@ -120,6 +124,8 @@ pub struct TaskDispatchData {
     pub client_repo_token: Option<String>,
     pub timeout: u64,
     pub environment: HashMap<String, String>,
+    pub prepare_repo_before_execute: bool,
+    pub cleanup_workspace_on_success: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -519,6 +525,8 @@ impl AgentClient {
                 client_repo_token,
                 timeout,
                 environment,
+                prepare_repo_before_execute,
+                cleanup_workspace_on_success,
             } => {
                 info!("Received task dispatch: {}", task_id);
                 let data = TaskDispatchData {
@@ -536,6 +544,8 @@ impl AgentClient {
                     client_repo_token,
                     timeout,
                     environment,
+                    prepare_repo_before_execute,
+                    cleanup_workspace_on_success,
                 };
                 // 在后台任务中执行，不阻塞消息接收循环，以便能接收 TaskCancel 消息
                 tokio::spawn(async move {

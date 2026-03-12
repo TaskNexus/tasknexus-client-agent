@@ -300,6 +300,8 @@ impl Agent {
                 data.client_repo_url.as_deref(),
                 &data.client_repo_ref,
                 data.client_repo_token.as_deref(),
+                data.prepare_repo_before_execute,
+                data.cleanup_workspace_on_success,
                 data.timeout,
                 Some(output_callback),
                 if data.environment.is_empty() {
