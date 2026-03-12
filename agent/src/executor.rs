@@ -2,9 +2,11 @@
 //!
 //! 在本地环境中执行服务器分发的命令。
 
+use crate::client::InlineCode;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
@@ -130,21 +132,24 @@ impl CommandExecutor {
         }
 
         // 从环境变量读取 SHELL，未设置则按平台使用默认值
-        let shell_from_env = environment
-            .and_then(|env| env.get("SHELL").cloned());
+        let shell_from_env = environment.and_then(|env| env.get("SHELL").cloned());
 
         let default_shell = {
             #[cfg(target_os = "macos")]
-            { "/bin/zsh" }
+            {
+                "/bin/zsh"
+            }
             #[cfg(target_os = "linux")]
-            { "/bin/bash" }
+            {
+                "/bin/bash"
+            }
             #[cfg(windows)]
-            { "cmd" }
+            {
+                "cmd"
+            }
         };
 
-        let shell_path = shell_from_env
-            .as_deref()
-            .unwrap_or(default_shell);
+        let shell_path = shell_from_env.as_deref().unwrap_or(default_shell);
 
         // 提取 shell 基本名称用于参数映射
         let shell_name = shell_path
@@ -209,7 +214,6 @@ impl CommandExecutor {
         // Unix: 使用 setsid 创建新进程组，以便后续可以 killpg 杀死整个进程树
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             unsafe {
                 cmd.pre_exec(|| {
                     libc::setsid();
@@ -365,9 +369,7 @@ impl CommandExecutor {
             let result = timed_future.await;
             match result {
                 Ok((stdout_lines, stderr_lines, status)) => {
-                    let exit_code = status
-                        .map(|s| s.code().unwrap_or(-1))
-                        .unwrap_or(-1);
+                    let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
                     let raw_stdout = stdout_lines.join("\n");
                     let (stdout, result) = extract_result(&raw_stdout);
                     ExecutionResult {
@@ -419,7 +421,9 @@ impl TaskRunner {
     pub async fn run_task<F, Fut>(
         &self,
         task_id: i64,
+        execution_mode: &str,
         command: &str,
+        code: Option<&InlineCode>,
         workspace_name: &str,
         client_repo_url: Option<&str>,
         client_repo_ref: &str,
@@ -433,17 +437,26 @@ impl TaskRunner {
         F: Fn(String, bool) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        let normalized_mode = if execution_mode.eq_ignore_ascii_case("code") {
+            "code"
+        } else {
+            "command"
+        };
+
         info!(
-            "Running task {} in workspace '{}': {}",
-            task_id, workspace_name, command
+            "Running task {} in workspace '{}' with execution mode '{}'",
+            task_id, workspace_name, normalized_mode
         );
+        if normalized_mode == "command" {
+            info!("Command input: {}", command);
+        }
         debug!(
             "client_repo_url={:?}, client_repo_ref={}",
             client_repo_url, client_repo_ref
         );
 
         // 获取/创建工作空间目录
-        let workspace_dir = self.workspaces_path.join(workspace_name);
+        let mut workspace_dir = self.workspaces_path.join(workspace_name);
         if let Err(e) = std::fs::create_dir_all(&workspace_dir) {
             error!("Failed to create workspace directory: {}", e);
             return ExecutionResult {
@@ -456,36 +469,59 @@ impl TaskRunner {
             };
         }
 
+        // 统一使用绝对路径，避免 code 模式下脚本路径与 cwd 的相对路径叠加导致找不到文件
+        if let Ok(canonical_workspace) = std::fs::canonicalize(&workspace_dir) {
+            workspace_dir = canonical_workspace;
+        } else if workspace_dir.is_relative() {
+            if let Ok(cwd) = std::env::current_dir() {
+                workspace_dir = cwd.join(workspace_dir);
+            }
+        }
+
         // 确定执行目录: 始终使用 workspace 目录作为 cwd
         let exec_dir = workspace_dir.clone();
 
         // 从 URL 提取仓库名称，连字符替换为下划线以兼容 Python 包名
-        let repo_name = client_repo_url
-            .filter(|u| !u.is_empty())
-            .map(|u| {
-                u.trim_end_matches('/')
-                    .split('/')
-                    .last()
-                    .unwrap_or("repo")
-                    .trim_end_matches(".git")
-                    .replace('-', "_")
-            });
+        let repo_name = client_repo_url.filter(|u| !u.is_empty()).map(|u| {
+            u.trim_end_matches('/')
+                .split('/')
+                .last()
+                .unwrap_or("repo")
+                .trim_end_matches(".git")
+                .replace('-', "_")
+        });
 
-        // command 为空时，执行 clone/update 后直接返回（workspace_acquire 阶段）
-        if command.is_empty() {
+        // command 模式下 command 为空时，执行 clone/update 后直接返回（workspace_acquire 阶段）
+        if normalized_mode == "command" && command.is_empty() {
             if let Some(ref repo_name) = repo_name {
                 if let Some(repo_url) = client_repo_url {
                     let repo_path = workspace_dir.join(repo_name);
 
                     if !repo_path.exists() {
                         info!("Cloning repository {} to {:?}", repo_url, repo_path);
-                        let result = self.clone_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
+                        let result = self
+                            .clone_repo(
+                                repo_url,
+                                &repo_path,
+                                client_repo_ref,
+                                client_repo_token,
+                                on_output.clone(),
+                            )
+                            .await;
                         if result.exit_code != 0 {
                             return result;
                         }
                     } else {
                         info!("Updating repository: {:?}", repo_path);
-                        let update_result = self.update_repo(repo_url, &repo_path, client_repo_ref, client_repo_token, on_output.clone()).await;
+                        let update_result = self
+                            .update_repo(
+                                repo_url,
+                                &repo_path,
+                                client_repo_ref,
+                                client_repo_token,
+                                on_output.clone(),
+                            )
+                            .await;
                         if update_result.exit_code != 0 {
                             warn!("Failed to update repository (will continue anyway)");
                         }
@@ -504,21 +540,85 @@ impl TaskRunner {
             };
         }
 
-        // 根据仓库名和脚本路径构建实际执行命令
-        // command 为相对于仓库根目录的脚本路径，如 "entries/project_setup.py"
-        // 拼接为 "{repo_name}/{command}"，再根据扩展名生成执行命令
-        let actual_command = if let Some(ref repo_name) = repo_name {
-            let script_path = format!("{}/{}", repo_name, command);
-            Self::build_script_command(&script_path)
+        let mut temp_code_path: Option<PathBuf> = None;
+        let actual_command = if normalized_mode == "code" {
+            let inline_code = match code {
+                Some(value) => value,
+                None => {
+                    return ExecutionResult {
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: "Code mode selected but no code payload provided".to_string(),
+                        timed_out: false,
+                        cancelled: false,
+                        result: HashMap::new(),
+                    }
+                }
+            };
+
+            let language = inline_code.language.trim().to_lowercase();
+            if language != "shell" && language != "python" {
+                return ExecutionResult {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: format!("Unsupported code language: {}", inline_code.language),
+                    timed_out: false,
+                    cancelled: false,
+                    result: HashMap::new(),
+                };
+            }
+
+            if inline_code.content.trim().is_empty() {
+                return ExecutionResult {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: "Code content is empty".to_string(),
+                    timed_out: false,
+                    cancelled: false,
+                    result: HashMap::new(),
+                };
+            }
+
+            let temp_path = match Self::create_temp_code_file(
+                &workspace_dir,
+                task_id,
+                &language,
+                &inline_code.content,
+            ) {
+                Ok(path) => path,
+                Err(err_msg) => {
+                    return ExecutionResult {
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: err_msg,
+                        timed_out: false,
+                        cancelled: false,
+                        result: HashMap::new(),
+                    }
+                }
+            };
+            temp_code_path = Some(temp_path.clone());
+            Self::build_inline_code_command(&language, &temp_path)
         } else {
-            Self::build_script_command(command)
+            // 根据仓库名和脚本路径构建实际执行命令
+            // command 为相对于仓库根目录的脚本路径，如 "entries/project_setup.py"
+            // 拼接为 "{repo_name}/{command}"，再根据扩展名生成执行命令
+            if let Some(ref repo_name) = repo_name {
+                let script_path = format!("{}/{}", repo_name, command);
+                Self::build_script_command(&script_path)
+            } else {
+                Self::build_script_command(command)
+            }
         };
         info!("Resolved command: {}", actual_command);
 
         // 设置环境变量
         let mut task_env = self.base_env.clone();
         task_env.insert("TASKNEXUS_TASK_ID".to_string(), task_id.to_string());
-        task_env.insert("TASKNEXUS_WORKSPACE".to_string(), workspace_name.to_string());
+        task_env.insert(
+            "TASKNEXUS_WORKSPACE".to_string(),
+            workspace_name.to_string(),
+        );
 
         // 合并任务自定义环境变量，允许覆盖默认代理配置
         if let Some(env) = environment {
@@ -538,6 +638,15 @@ impl TaskRunner {
             )
             .await;
 
+        // 清理 code 模式下创建的临时脚本文件
+        if let Some(path) = temp_code_path {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!("Failed to remove temp code file {:?}: {}", path, e);
+            } else {
+                debug!("Removed temp code file {:?}", path);
+            }
+        }
+
         if result.exit_code != 0 {
             error!("Command failed with exit code {}", result.exit_code);
             if !result.stderr.is_empty() {
@@ -546,6 +655,33 @@ impl TaskRunner {
         }
 
         result
+    }
+
+    fn create_temp_code_file(
+        workspace_dir: &Path,
+        task_id: i64,
+        language: &str,
+        content: &str,
+    ) -> Result<PathBuf, String> {
+        let ext = if language == "python" { "py" } else { "sh" };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let file_name = format!(".tasknexus_inline_{}_{}.{}", task_id, now, ext);
+        let file_path = workspace_dir.join(file_name);
+        std::fs::write(&file_path, content)
+            .map_err(|e| format!("Failed to write inline code file: {}", e))?;
+        Ok(file_path)
+    }
+
+    fn build_inline_code_command(language: &str, script_path: &Path) -> String {
+        let quoted_path = Self::quote_command_arg(script_path);
+        if language == "python" {
+            format!("python {}", quoted_path)
+        } else {
+            format!("bash {}", quoted_path)
+        }
     }
 
     /// 根据脚本路径的扩展名生成执行命令
@@ -557,7 +693,19 @@ impl TaskRunner {
             "js" => format!("node {}", script_path),
             "ts" => format!("npx ts-node {}", script_path),
             "rb" => format!("ruby {}", script_path),
-            _    => script_path.to_string(),
+            _ => script_path.to_string(),
+        }
+    }
+
+    fn quote_command_arg(path: &Path) -> String {
+        let raw = path.to_string_lossy().to_string();
+        #[cfg(windows)]
+        {
+            format!("\"{}\"", raw.replace('"', "\\\""))
+        }
+        #[cfg(not(windows))]
+        {
+            format!("'{}'", raw.replace('\'', "'\"'\"'"))
         }
     }
 

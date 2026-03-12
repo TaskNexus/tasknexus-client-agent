@@ -13,10 +13,10 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use tasknexus_agent::{
-    config::{load_config, AgentConfig},
-    client::{AgentClient, TaskDispatchData},
-    executor::TaskRunner,
     autostart::AutoStartManager,
+    client::{AgentClient, TaskDispatchData},
+    config::{load_config, AgentConfig},
+    executor::TaskRunner,
 };
 
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
@@ -91,7 +91,9 @@ fn setup_logging(log_level: &str, log_file: Option<&PathBuf>) {
         }
         let file_appender = tracing_appender::rolling::daily(
             log_path.parent().unwrap_or(std::path::Path::new(".")),
-            log_path.file_name().unwrap_or(std::ffi::OsStr::new("agent.log")),
+            log_path
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("agent.log")),
         );
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         subscriber.with_writer(non_blocking).init();
@@ -135,22 +137,25 @@ impl Agent {
         let agent_cancel = agent.clone();
 
         // 运行客户端
-        agent.client.run(
-            move |data| {
-                let agent = agent_clone.clone();
-                async move {
-                    agent.handle_task_dispatch(data).await;
-                }
-            },
-            move |task_id| {
-                let agent = agent_cancel.clone();
-                async move {
-                    agent.handle_task_cancel(task_id).await;
-                }
-            },
-            || info!("Connected to TaskNexus server"),
-            || warn!("Disconnected from TaskNexus server"),
-        ).await?;
+        agent
+            .client
+            .run(
+                move |data| {
+                    let agent = agent_clone.clone();
+                    async move {
+                        agent.handle_task_dispatch(data).await;
+                    }
+                },
+                move |task_id| {
+                    let agent = agent_cancel.clone();
+                    async move {
+                        agent.handle_task_cancel(task_id).await;
+                    }
+                },
+                || info!("Connected to TaskNexus server"),
+                || warn!("Disconnected from TaskNexus server"),
+            )
+            .await?;
 
         Ok(())
     }
@@ -158,12 +163,25 @@ impl Agent {
     async fn handle_task_dispatch(&self, data: TaskDispatchData) {
         let task_id = data.task_id;
         let workspace_name = data.workspace_name.clone();
+        let execution_mode = data.execution_mode.clone();
         let command = data.command.clone();
 
-        info!(
-            "Received task {} for workspace '{}': {}",
-            task_id, workspace_name, command
-        );
+        if execution_mode == "code" {
+            let language = data
+                .code
+                .as_ref()
+                .map(|item| item.language.as_str())
+                .unwrap_or("unknown");
+            info!(
+                "Received task {} for workspace '{}' in code mode (language={})",
+                task_id, workspace_name, language
+            );
+        } else {
+            info!(
+                "Received task {} for workspace '{}': {}",
+                task_id, workspace_name, command
+            );
+        }
 
         // 防止重复分发同一个 task_id（例如重试场景）
         {
@@ -211,7 +229,8 @@ impl Agent {
         });
 
         // 创建日志缓冲区，按批次发送（每 500ms）
-        let log_buffer: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let log_buffer: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         // 输出回调 — 只缓冲日志行，不立即发送
         let buffer_for_callback = log_buffer.clone();
@@ -219,7 +238,10 @@ impl Agent {
             let buffer = buffer_for_callback.clone();
             let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
             async move {
-                buffer.lock().await.push(format!("[{}] {}", timestamp, line));
+                buffer
+                    .lock()
+                    .await
+                    .push(format!("[{}] {}", timestamp, line));
             }
         };
 
@@ -243,18 +265,27 @@ impl Agent {
         });
 
         // 执行任务，传入取消信号
-        let result = self.task_runner.run_task(
-            task_id,
-            &data.command,
-            &data.workspace_name,
-            data.client_repo_url.as_deref(),
-            &data.client_repo_ref,
-            data.client_repo_token.as_deref(),
-            data.timeout,
-            Some(output_callback),
-            if data.environment.is_empty() { None } else { Some(data.environment) },
-            Some(cancel_rx),
-        ).await;
+        let result = self
+            .task_runner
+            .run_task(
+                task_id,
+                &data.execution_mode,
+                &data.command,
+                data.code.as_ref(),
+                &data.workspace_name,
+                data.client_repo_url.as_deref(),
+                &data.client_repo_ref,
+                data.client_repo_token.as_deref(),
+                data.timeout,
+                Some(output_callback),
+                if data.environment.is_empty() {
+                    None
+                } else {
+                    Some(data.environment)
+                },
+                Some(cancel_rx),
+            )
+            .await;
 
         // 停止日志批量发送和心跳
         log_flush_task.abort();
@@ -275,38 +306,56 @@ impl Agent {
 
         // 发送结果
         if result.cancelled {
-            info!("Task {} was cancelled, not sending completion (server already handled)", task_id);
+            info!(
+                "Task {} was cancelled, not sending completion (server already handled)",
+                task_id
+            );
         } else if result.exit_code == 0 {
-            if let Err(e) = self.client.send_task_completed(
-                task_id,
-                result.exit_code,
-                result.stdout,
-                result.stderr,
-                result.result,
-            ).await {
-                error!("Failed to send task completed: {}", e);
-            }
-            info!("Task {} completed successfully", task_id);
-        } else {
-            if result.timed_out {
-                if let Err(e) = self.client.send_task_failed(
-                    task_id,
-                    format!("Task timed out after {} seconds", data.timeout),
-                ).await {
-                    error!("Failed to send task failed: {}", e);
-                }
-            } else {
-                if let Err(e) = self.client.send_task_completed(
+            if let Err(e) = self
+                .client
+                .send_task_completed(
                     task_id,
                     result.exit_code,
                     result.stdout,
                     result.stderr,
                     result.result,
-                ).await {
+                )
+                .await
+            {
+                error!("Failed to send task completed: {}", e);
+            }
+            info!("Task {} completed successfully", task_id);
+        } else {
+            if result.timed_out {
+                if let Err(e) = self
+                    .client
+                    .send_task_failed(
+                        task_id,
+                        format!("Task timed out after {} seconds", data.timeout),
+                    )
+                    .await
+                {
+                    error!("Failed to send task failed: {}", e);
+                }
+            } else {
+                if let Err(e) = self
+                    .client
+                    .send_task_completed(
+                        task_id,
+                        result.exit_code,
+                        result.stdout,
+                        result.stderr,
+                        result.result,
+                    )
+                    .await
+                {
                     error!("Failed to send task completed: {}", e);
                 }
             }
-            warn!("Task {} failed with exit code {}", task_id, result.exit_code);
+            warn!(
+                "Task {} failed with exit code {}",
+                task_id, result.exit_code
+            );
         }
 
         // 移除运行中的任务
@@ -317,7 +366,10 @@ impl Agent {
         info!("Processing cancel for task {}", task_id);
         let running = self.running_tasks.read().await;
         if let Some((workspace_name, cancel_tx)) = running.get(&task_id) {
-            info!("Sending cancel signal to task {} in workspace '{}'", task_id, workspace_name);
+            info!(
+                "Sending cancel signal to task {} in workspace '{}'",
+                task_id, workspace_name
+            );
             let _ = cancel_tx.send(true);
             return;
         }
@@ -362,7 +414,6 @@ async fn main() {
     }
 }
 
-
 /// 根据配置自动应用开机自启动设置
 fn apply_autostart_from_config(config: &AgentConfig, config_path: &PathBuf) {
     let extra_args = if config.autostart.args.is_empty() {
@@ -381,7 +432,7 @@ fn apply_autostart_from_config(config: &AgentConfig, config_path: &PathBuf) {
 
     // 检查当前状态是否与配置一致
     let current_enabled = manager.is_enabled().unwrap_or(false);
-    
+
     if config.autostart.enabled && !current_enabled {
         // 配置要求启用，但当前未启用
         match manager.enable() {

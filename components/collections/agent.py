@@ -4,7 +4,7 @@ from django.utils import timezone
 from pipeline.component_framework.component import Component
 from pipeline.core.flow.activity import Service, StaticIntervalGenerator
 from pipeline.core.flow.io import StringItemSchema, ObjectItemSchema
-from components.schemas import ExtendedArraySchema
+from components.schemas import ExtendedArraySchema, ExtendedStringSchema, ExtendedObjectSchema
 from client_agents.dispatch_stream import publish_dispatch_event
 
 logger = logging.getLogger('django')
@@ -12,6 +12,9 @@ logger = logging.getLogger('django')
 MAX_WAIT_FOR_AGENT = 600  # 10 minutes
 HEARTBEAT_TIMEOUT_SECONDS = 120
 HEARTBEAT_TIMEOUT_RETRY = 3
+EXECUTION_MODE_COMMAND = 'command'
+EXECUTION_MODE_CODE = 'code'
+ALLOWED_CODE_LANGUAGES = {'shell', 'python'}
 
 class ClientAgentService(Service):
     __need_schedule__ = True
@@ -49,20 +52,66 @@ class ClientAgentService(Service):
                 normalized[key] = '' if value is None else str(value)
 
         return normalized
+
+    @staticmethod
+    def _normalize_execution_mode(raw_mode):
+        mode = str(raw_mode or '').strip().lower()
+        if mode == EXECUTION_MODE_CODE:
+            return EXECUTION_MODE_CODE
+        return EXECUTION_MODE_COMMAND
+
+    @staticmethod
+    def _normalize_code_input(raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+            if not raw_value:
+                return {'language': 'shell', 'content': ''}
+            try:
+                raw_value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                return {'language': 'shell', 'content': raw_value}
+
+        if not isinstance(raw_value, dict):
+            return {'language': 'shell', 'content': ''}
+
+        if raw_value.get('language') is None or str(raw_value.get('language')).strip() == '':
+            language = 'shell'
+        else:
+            language = str(raw_value.get('language')).strip().lower()
+
+        content = raw_value.get('content', '')
+        if content is None:
+            content = ''
+        content = str(content)
+
+        return {
+            'language': language,
+            'content': content,
+        }
     
     def execute(self, data, parent_data):
-        from client_agents.models import ClientAgent, AgentWorkspace
+        from client_agents.models import AgentWorkspace
         from projects.models import Project
         
         workspace_id = data.get_one_of_inputs('workspace_id')
-        command = data.get_one_of_inputs('command', '')
+        execution_mode = self._normalize_execution_mode(data.get_one_of_inputs('execution_mode', EXECUTION_MODE_COMMAND))
+        command = str(data.get_one_of_inputs('command', '') or '').strip()
+        code = self._normalize_code_input(data.get_one_of_inputs('code', {}))
         timeout = data.get_one_of_inputs('timeout', 3600)
         parameters = data.get_one_of_inputs('parameters', [])
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         project_id = parent_data.get_one_of_inputs('project_id', '')
         
-        if not command:
-            data.outputs.ex_data = 'No command provided'
+        if execution_mode == EXECUTION_MODE_COMMAND and not command:
+            data.outputs.ex_data = 'Command is required when execution mode is command'
+            return False
+
+        if execution_mode == EXECUTION_MODE_CODE and not code.get('content', '').strip():
+            data.outputs.ex_data = 'Code content is required when execution mode is code'
+            return False
+
+        if execution_mode == EXECUTION_MODE_CODE and code.get('language') not in ALLOWED_CODE_LANGUAGES:
+            data.outputs.ex_data = f'Unsupported code language: {code.get("language")}'
             return False
 
         # 从项目配置读取仓库信息
@@ -79,7 +128,14 @@ class ClientAgentService(Service):
             except Project.DoesNotExist:
                 pass
         
+        display_command = command
+        if execution_mode == EXECUTION_MODE_CODE:
+            display_command = f'[inline_code:{code.get("language", "shell")}]'
+
+        data.set_outputs('_execution_mode', execution_mode)
         data.set_outputs('_command', command)
+        data.set_outputs('_display_command', display_command)
+        data.set_outputs('_code', code)
         data.set_outputs('_timeout', int(timeout) if timeout else 3600)
         data.set_outputs('_pipeline_id', pipeline_id)
         data.set_outputs('_client_repo_url', client_repo_url)
@@ -100,10 +156,13 @@ class ClientAgentService(Service):
         return success if success else False
     
     def _dispatch_task(self, data, workspace):
-        from client_agents.models import ClientAgent, AgentTask, AgentWorkspace
+        from client_agents.models import AgentTask
         
         agent = workspace.agent
+        execution_mode = self._normalize_execution_mode(data.get_one_of_outputs('_execution_mode', EXECUTION_MODE_COMMAND))
         command = data.get_one_of_outputs('_command')
+        display_command = str(data.get_one_of_outputs('_display_command', command) or '')
+        code = self._normalize_code_input(data.get_one_of_outputs('_code', {}))
         timeout = data.get_one_of_outputs('_timeout', 3600)
         pipeline_id = data.get_one_of_outputs('_pipeline_id', '')
         client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
@@ -118,7 +177,7 @@ class ClientAgentService(Service):
                 agent=agent,
                 workspace=workspace,
                 pipeline_id=pipeline_id,
-                command=command,
+                command=display_command,
                 timeout=timeout,
                 status='PENDING',
             )
@@ -141,7 +200,9 @@ class ClientAgentService(Service):
                     "client_repo_url": client_repo_url,
                     "client_repo_ref": client_repo_ref,
                     "client_repo_token": client_repo_token,
+                    "execution_mode": execution_mode,
                     "command": command,
+                    "code": code,
                     "timeout": timeout,
                     "environment": merged_environment,
                 },
@@ -260,7 +321,45 @@ class ClientAgentService(Service):
     def inputs_format(self):
         return [
             self.InputItem(name='Workspace ID', key='workspace_id', type='int', required=True),
-            self.InputItem(name='Script Path', key='command', type='string', required=True),
+            self.InputItem(
+                name='Execution Mode',
+                key='execution_mode',
+                type='string',
+                required=False,
+                schema=ExtendedStringSchema(
+                    description='Task execution mode',
+                    param_type='select',
+                    enum=[EXECUTION_MODE_COMMAND, EXECUTION_MODE_CODE],
+                ),
+            ),
+            self.InputItem(
+                name='Command',
+                key='command',
+                type='string',
+                required=False,
+                schema=ExtendedStringSchema(
+                    description='Script path or command to execute',
+                    visible_when={'execution_mode': EXECUTION_MODE_COMMAND},
+                ),
+            ),
+            self.InputItem(
+                name='Code',
+                key='code',
+                type='object',
+                required=False,
+                schema=ExtendedObjectSchema(
+                    property_schemas={
+                        'language': StringItemSchema(
+                            description='Code language. One of shell/python',
+                            enum=['shell', 'python'],
+                        ),
+                        'content': StringItemSchema(description='Code content to execute'),
+                    },
+                    description='Inline code execution payload',
+                    param_type='code_editor',
+                    visible_when={'execution_mode': EXECUTION_MODE_CODE},
+                ),
+            ),
             self.InputItem(name='Timeout (s)', key='timeout', type='int', required=False),
             self.InputItem(
                 name='Parameters',

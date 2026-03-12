@@ -14,6 +14,18 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineCode {
+    #[serde(default = "default_code_language")]
+    pub language: String,
+    #[serde(default)]
+    pub content: String,
+}
+
+fn default_code_language() -> String {
+    "shell".to_string()
+}
+
 /// 服务器发送的消息类型
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -28,8 +40,12 @@ pub enum ServerMessage {
         task_id: i64,
         #[serde(default)]
         workspace_name: String,
+        #[serde(default = "default_execution_mode")]
+        execution_mode: String,
         #[serde(default)]
         command: String,
+        #[serde(default)]
+        code: Option<InlineCode>,
         #[serde(default)]
         client_repo_url: Option<String>,
         #[serde(default = "default_ref")]
@@ -54,16 +70,38 @@ fn default_timeout() -> u64 {
     3600
 }
 
+fn default_execution_mode() -> String {
+    "command".to_string()
+}
+
 /// 客户端发送的消息类型
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Heartbeat { system_info: SystemInfo },
-    TaskStarted { task_id: i64 },
-    TaskProgress { task_id: i64, output: String },
-    TaskCompleted { task_id: i64, exit_code: i32, stdout: String, stderr: String, result: HashMap<String, serde_json::Value> },
-    TaskFailed { task_id: i64, error: String },
-    TaskHeartbeat { task_id: i64 },
+    Heartbeat {
+        system_info: SystemInfo,
+    },
+    TaskStarted {
+        task_id: i64,
+    },
+    TaskProgress {
+        task_id: i64,
+        output: String,
+    },
+    TaskCompleted {
+        task_id: i64,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        result: HashMap<String, serde_json::Value>,
+    },
+    TaskFailed {
+        task_id: i64,
+        error: String,
+    },
+    TaskHeartbeat {
+        task_id: i64,
+    },
 }
 
 /// 任务分发的数据
@@ -71,7 +109,9 @@ pub enum ClientMessage {
 pub struct TaskDispatchData {
     pub task_id: i64,
     pub workspace_name: String,
+    pub execution_mode: String,
     pub command: String,
+    pub code: Option<InlineCode>,
     pub client_repo_url: Option<String>,
     pub client_repo_ref: String,
     pub client_repo_token: Option<String>,
@@ -104,17 +144,24 @@ impl AgentClient {
 
     /// 构建带 name 的 WebSocket URL
     fn ws_url(&self) -> Result<Url> {
-        let separator = if self.config.server.contains('?') { "&" } else { "?" };
-        let url_str = format!("{}{}name={}", self.config.server, separator, self.config.name);
+        let separator = if self.config.server.contains('?') {
+            "&"
+        } else {
+            "?"
+        };
+        let url_str = format!(
+            "{}{}name={}",
+            self.config.server, separator, self.config.name
+        );
         Url::parse(&url_str).map_err(AgentError::from)
     }
 
     async fn send_control_message(&self, message: ClientMessage) -> Result<()> {
         let sender = self.control_sender.read().await;
         if let Some(tx) = sender.as_ref() {
-            tx.send(message)
-                .await
-                .map_err(|e| AgentError::Connection(format!("Failed to send control message: {}", e)))?;
+            tx.send(message).await.map_err(|e| {
+                AgentError::Connection(format!("Failed to send control message: {}", e))
+            })?;
             return Ok(());
         }
         warn!("Cannot send control message: not connected");
@@ -124,9 +171,9 @@ impl AgentClient {
     async fn send_log_message(&self, message: ClientMessage) -> Result<()> {
         let sender = self.log_sender.read().await;
         if let Some(tx) = sender.as_ref() {
-            tx.send(message)
-                .await
-                .map_err(|e| AgentError::Connection(format!("Failed to send log message: {}", e)))?;
+            tx.send(message).await.map_err(|e| {
+                AgentError::Connection(format!("Failed to send log message: {}", e))
+            })?;
             return Ok(());
         }
         warn!("Cannot send log message: not connected");
@@ -151,7 +198,8 @@ impl AgentClient {
 
     /// 发送任务开始通知
     pub async fn send_task_started(&self, task_id: i64) -> Result<()> {
-        self.send_message(ClientMessage::TaskStarted { task_id }).await
+        self.send_message(ClientMessage::TaskStarted { task_id })
+            .await
     }
 
     /// 发送任务进度更新
@@ -175,12 +223,14 @@ impl AgentClient {
             stdout,
             stderr,
             result,
-        }).await
+        })
+        .await
     }
 
     /// 发送任务失败通知
     pub async fn send_task_failed(&self, task_id: i64, error: String) -> Result<()> {
-        self.send_message(ClientMessage::TaskFailed { task_id, error }).await
+        self.send_message(ClientMessage::TaskFailed { task_id, error })
+            .await
     }
 
     /// 发送任务心跳
@@ -207,7 +257,11 @@ impl AgentClient {
 
         while *self.running.read().await {
             match self
-                .message_loop(on_task_dispatch.clone(), on_task_cancel.clone(), &on_connected)
+                .message_loop(
+                    on_task_dispatch.clone(),
+                    on_task_cancel.clone(),
+                    &on_connected,
+                )
                 .await
             {
                 Ok(_) => {
@@ -223,7 +277,8 @@ impl AgentClient {
 
                     if *self.running.read().await {
                         warn!("Connection lost, will reconnect...");
-                        tokio::time::sleep(Duration::from_secs(self.config.reconnect_interval)).await;
+                        tokio::time::sleep(Duration::from_secs(self.config.reconnect_interval))
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -249,7 +304,10 @@ impl AgentClient {
                         self.config.reconnect_interval * 2u64.pow(std::cmp::min(attempts, 5)),
                         60,
                     );
-                    info!("Reconnecting in {} seconds... (attempt {})", wait_time, attempts);
+                    info!(
+                        "Reconnecting in {} seconds... (attempt {})",
+                        wait_time, attempts
+                    );
                     tokio::time::sleep(Duration::from_secs(wait_time)).await;
                 }
             }
@@ -368,16 +426,19 @@ impl AgentClient {
         // 消息接收循环
         while let Some(msg) = read.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<ServerMessage>(&text) {
-                        Ok(server_msg) => {
-                            self.handle_message(server_msg, on_task_dispatch.clone(), on_task_cancel.clone()).await;
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse message: {} - {}", e, text);
-                        }
+                Ok(Message::Text(text)) => match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(server_msg) => {
+                        self.handle_message(
+                            server_msg,
+                            on_task_dispatch.clone(),
+                            on_task_cancel.clone(),
+                        )
+                        .await;
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to parse message: {} - {}", e, text);
+                    }
+                },
                 Ok(Message::Close(_)) => {
                     info!("Server closed connection");
                     break;
@@ -404,8 +465,12 @@ impl AgentClient {
     }
 
     /// 处理接收到的消息
-    async fn handle_message<F, G, Fut1, Fut2>(&self, message: ServerMessage, on_task_dispatch: F, on_task_cancel: G)
-    where
+    async fn handle_message<F, G, Fut1, Fut2>(
+        &self,
+        message: ServerMessage,
+        on_task_dispatch: F,
+        on_task_cancel: G,
+    ) where
         F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + 'static,
         Fut1: std::future::Future<Output = ()> + Send + 'static,
         G: Fn(i64) -> Fut2 + Send + Sync,
@@ -421,7 +486,9 @@ impl AgentClient {
             ServerMessage::TaskDispatch {
                 task_id,
                 workspace_name,
+                execution_mode,
                 command,
+                code,
                 client_repo_url,
                 client_repo_ref,
                 client_repo_token,
@@ -436,7 +503,9 @@ impl AgentClient {
                     } else {
                         workspace_name
                     },
+                    execution_mode,
                     command,
+                    code,
                     client_repo_url,
                     client_repo_ref,
                     client_repo_token,
