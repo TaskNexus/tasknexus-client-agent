@@ -54,7 +54,6 @@ jobs:
       WINDOWS_CODESIGN_CERT_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_BASE64 }}
       WINDOWS_CODESIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
       WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
-      TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN: ${{ secrets.MANIFEST_SIGNING_PUBLIC_KEY_B64 }}
 
     steps:
       - name: Checkout code
@@ -92,36 +91,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Validate embedded update public key (release tags)
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          if [[ -z "$TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN" ]]; then
-            echo "MANIFEST_SIGNING_PUBLIC_KEY_B64 secret is required for release builds."
-            exit 1
-          fi
-          python3 - <<'PY'
-          import base64
-          import os
-          import sys
-
-          value = os.environ.get("TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN", "").strip()
-          try:
-              decoded = base64.b64decode(value, validate=True)
-          except Exception as exc:
-              print(f"Invalid MANIFEST_SIGNING_PUBLIC_KEY_B64 base64: {exc}")
-              sys.exit(1)
-
-          if len(decoded) != 32:
-              print(
-                  "Invalid MANIFEST_SIGNING_PUBLIC_KEY_B64 length: "
-                  f"expected 32 bytes, got {len(decoded)}"
-              )
-              sys.exit(1)
-
-          print("Embedded update public key looks valid (32-byte Ed25519 public key).")
-          PY
 
       - name: Build agent executable
         run: cargo build --release --target ${{ matrix.target }}
@@ -203,9 +172,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    env:
-      MANIFEST_SIGNING_PRIVATE_KEY_B64: ${{ secrets.MANIFEST_SIGNING_PRIVATE_KEY_B64 }}
-      MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
 
     steps:
       - name: Download all artifacts
@@ -227,61 +193,6 @@ jobs:
         run: |
           cd release-assets
           sha256sum * > checksums.txt
-
-      - name: Generate manifest.json
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          tag = os.environ["GITHUB_REF"].replace("refs/tags/", "", 1)
-          repo = os.environ["GITHUB_REPOSITORY"]
-          key_id = os.environ.get("MANIFEST_SIGNING_KEY_ID", "main") or "main"
-          base_url = f"https://github.com/{repo}/releases/download/{tag}/"
-          checksums_path = Path("release-assets/checksums.txt")
-          manifest_path = Path("release-assets/manifest.json")
-
-          assets = []
-          for line in checksums_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-              continue
-            checksum, name = line.split(maxsplit=1)
-            if name in {"manifest.json", "manifest.sig", "checksums.txt"}:
-              continue
-            assets.append({
-              "name": name,
-              "sha256": checksum,
-              "url": base_url + name,
-            })
-
-          manifest = {
-            "version": tag,
-            "key_id": key_id,
-            "assets": assets,
-          }
-          manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-          )
-          PY
-
-      - name: Sign manifest (Ed25519)
-        shell: bash
-        run: |
-          if [[ -z "$MANIFEST_SIGNING_PRIVATE_KEY_B64" ]]; then
-            echo "MANIFEST_SIGNING_PRIVATE_KEY_B64 secret is required for release signing."
-            exit 1
-          fi
-
-          KEY_PATH="$RUNNER_TEMP/manifest-signing.key"
-          SIG_BIN="$RUNNER_TEMP/manifest.sig.bin"
-          echo "$MANIFEST_SIGNING_PRIVATE_KEY_B64" | base64 --decode > "$KEY_PATH"
-          openssl pkeyutl -sign -inkey "$KEY_PATH" -rawin -in release-assets/manifest.json -out "$SIG_BIN"
-          base64 -w 0 "$SIG_BIN" > release-assets/manifest.sig
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
