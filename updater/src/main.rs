@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -114,8 +115,11 @@ fn replace_binary(current_exe: &Path, new_exe: &Path) -> Result<(), Box<dyn Erro
 
 fn restart_agent(executable: &Path, restart_args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut command = std::process::Command::new(executable);
-    // Preserve parent's stdio so restart behavior matches direct terminal launch.
-    command.args(restart_args);
+    command
+        .args(restart_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     #[cfg(windows)]
     {
