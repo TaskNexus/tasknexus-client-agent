@@ -71,6 +71,36 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Validate embedded update public key (release tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          if [[ -z "$TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN" ]]; then
+            echo "MANIFEST_SIGNING_PUBLIC_KEY_B64 secret is required for release builds."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import base64
+          import os
+          import sys
+
+          value = os.environ.get("TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN", "").strip()
+          try:
+              decoded = base64.b64decode(value, validate=True)
+          except Exception as exc:
+              print(f"Invalid MANIFEST_SIGNING_PUBLIC_KEY_B64 base64: {exc}")
+              sys.exit(1)
+
+          if len(decoded) != 32:
+              print(
+                  "Invalid MANIFEST_SIGNING_PUBLIC_KEY_B64 length: "
+                  f"expected 32 bytes, got {len(decoded)}"
+              )
+              sys.exit(1)
+
+          print("Embedded update public key looks valid (32-byte Ed25519 public key).")
+          PY
+
       - name: Build agent executable
         run: cargo build --release --target ${{ matrix.target }}
         working-directory: agent

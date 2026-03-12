@@ -21,8 +21,8 @@ const UPDATE_USER_AGENT: &str = "TaskNexus-Agent-SelfUpdate/1.0";
 // Build-time embedded default key for key_id=main.
 // In CI set TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN to match MANIFEST_SIGNING_PRIVATE_KEY_B64.
 const DEFAULT_PUBLIC_KEY_MAIN_B64: &str = match option_env!("TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN") {
-    Some(value) => value,
-    None => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    Some(value) if !value.is_empty() => value,
+    _ => "",
 };
 
 pub struct SelfUpdateResult {
@@ -285,7 +285,16 @@ fn resolve_public_key(key_id: &str) -> Result<String> {
     }
 
     match key_id {
-        DEFAULT_KEY_ID => Ok(DEFAULT_PUBLIC_KEY_MAIN_B64.to_string()),
+        DEFAULT_KEY_ID => {
+            let embedded = DEFAULT_PUBLIC_KEY_MAIN_B64.trim();
+            if embedded.is_empty() {
+                Err(AgentError::Execution(
+                    "No public key configured for key_id 'main'. Set TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN at runtime or embed it at build time.".to_string(),
+                ))
+            } else {
+                Ok(embedded.to_string())
+            }
+        }
         _ => Err(AgentError::Execution(format!(
             "No public key configured for key_id '{}'",
             key_id

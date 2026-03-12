@@ -21,18 +21,35 @@ struct Cli {
     #[arg(long = "restart-arg")]
     restart_args: Vec<String>,
 
+    // Backward compatibility for older agent versions that passed
+    // `--config <path>` directly to updater.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     #[arg(long, default_value_t = 120)]
     wait_timeout_seconds: u64,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let restart_args = build_restart_args(&cli);
 
     wait_for_process_exit(cli.pid, Duration::from_secs(cli.wait_timeout_seconds));
     replace_binary(&cli.current_exe, &cli.new_exe)?;
-    restart_agent(&cli.current_exe, &cli.restart_args)?;
+    restart_agent(&cli.current_exe, &restart_args)?;
 
     Ok(())
+}
+
+fn build_restart_args(cli: &Cli) -> Vec<String> {
+    let mut args = cli.restart_args.clone();
+    if args.is_empty() {
+        if let Some(config_path) = &cli.config {
+            args.push("--config".to_string());
+            args.push(config_path.to_string_lossy().to_string());
+        }
+    }
+    args
 }
 
 fn wait_for_process_exit(pid: u32, timeout: Duration) {
