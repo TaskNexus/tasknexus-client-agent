@@ -164,7 +164,7 @@ impl CommandExecutor {
 
         // 根据 shell 名称选择参数
         let shell_args: Vec<&str> = match shell_name {
-            "zsh" | "bash" => vec!["-l", "-i", "-c"],
+            "zsh" | "bash" => vec!["-l", "-c"],
             "sh" => vec!["-c"],
             "cmd" | "cmd.exe" => vec!["/C"],
             "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => vec!["-Command"],
@@ -200,7 +200,7 @@ impl CommandExecutor {
             }
         }
 
-        // 抑制 macOS 终端会话恢复（zsh -i 触发）
+        // 抑制 macOS 终端会话恢复
         #[cfg(target_os = "macos")]
         cmd.env("SHELL_SESSION_DID_INIT", "1");
 
@@ -757,7 +757,7 @@ impl TaskRunner {
     fn build_inline_code_command(language: &str, script_path: &Path) -> String {
         let quoted_path = Self::quote_command_arg(script_path);
         if language == "python" {
-            format!("python {}", quoted_path)
+            Self::build_python_command_with_quoted_path(&quoted_path)
         } else {
             format!("bash {}", quoted_path)
         }
@@ -767,7 +767,10 @@ impl TaskRunner {
     fn build_script_command(script_path: &str) -> String {
         let ext = script_path.rsplit('.').next().unwrap_or("");
         match ext {
-            "py" => format!("python {}", script_path),
+            "py" => {
+                let quoted_path = Self::quote_raw_arg(script_path);
+                Self::build_python_command_with_quoted_path(&quoted_path)
+            }
             "sh" => format!("bash {}", script_path),
             "js" => format!("node {}", script_path),
             "ts" => format!("npx ts-node {}", script_path),
@@ -776,8 +779,21 @@ impl TaskRunner {
         }
     }
 
-    fn quote_command_arg(path: &Path) -> String {
-        let raw = path.to_string_lossy().to_string();
+    fn build_python_command_with_quoted_path(quoted_path: &str) -> String {
+        #[cfg(windows)]
+        {
+            format!("python {}", quoted_path)
+        }
+        #[cfg(not(windows))]
+        {
+            format!(
+                "if command -v python3 >/dev/null 2>&1; then python3 {}; else python {}; fi",
+                quoted_path, quoted_path
+            )
+        }
+    }
+
+    fn quote_raw_arg(raw: &str) -> String {
         #[cfg(windows)]
         {
             format!("\"{}\"", raw.replace('"', "\\\""))
@@ -786,6 +802,11 @@ impl TaskRunner {
         {
             format!("'{}'", raw.replace('\'', "'\"'\"'"))
         }
+    }
+
+    fn quote_command_arg(path: &Path) -> String {
+        let raw = path.to_string_lossy().to_string();
+        Self::quote_raw_arg(&raw)
     }
 
     /// Inject token into an HTTPS URL for authenticated git operations
