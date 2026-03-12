@@ -182,7 +182,13 @@ impl AgentClient {
 
     /// 发送消息到服务器
     pub async fn send_message(&self, message: ClientMessage) -> Result<()> {
-        if matches!(message, ClientMessage::TaskProgress { .. }) {
+        // Keep task output and terminal events in the same queue so their ordering is stable.
+        if matches!(
+            message,
+            ClientMessage::TaskProgress { .. }
+                | ClientMessage::TaskCompleted { .. }
+                | ClientMessage::TaskFailed { .. }
+        ) {
             self.send_log_message(message).await
         } else {
             self.send_control_message(message).await
