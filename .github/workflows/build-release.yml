@@ -22,23 +22,40 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: tasknexus-agent.exe
-            asset_name: tasknexus-agent-windows-x86_64.exe
+            agent_artifact_name: tasknexus-agent.exe
+            agent_asset_name: tasknexus-agent-windows-x86_64.exe
+            updater_artifact_name: tasknexus-updater.exe
+            updater_asset_name: tasknexus-updater-windows-x86_64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: tasknexus-agent
-            asset_name: tasknexus-agent-linux-amd64
+            agent_artifact_name: tasknexus-agent
+            agent_asset_name: tasknexus-agent-linux-amd64
+            updater_artifact_name: tasknexus-updater
+            updater_asset_name: tasknexus-updater-linux-amd64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: tasknexus-agent
-            asset_name: tasknexus-agent-linux-arm64
+            agent_artifact_name: tasknexus-agent
+            agent_asset_name: tasknexus-agent-linux-arm64
+            updater_artifact_name: tasknexus-updater
+            updater_asset_name: tasknexus-updater-linux-arm64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: tasknexus-agent
-            asset_name: tasknexus-agent-macos-arm64
+            agent_artifact_name: tasknexus-agent
+            agent_asset_name: tasknexus-agent-macos-arm64
+            updater_artifact_name: tasknexus-updater
+            updater_asset_name: tasknexus-updater-macos-arm64
 
     runs-on: ${{ matrix.os }}
-    
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      MACOS_CODESIGN_CERT_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_BASE64 }}
+      MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
+      MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      WINDOWS_CODESIGN_CERT_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_BASE64 }}
+      WINDOWS_CODESIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
+      WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+      TASKNEXUS_UPDATE_PUBLIC_KEY_MAIN: ${{ secrets.MANIFEST_SIGNING_PUBLIC_KEY_B64 }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -54,32 +71,72 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build executable
+      - name: Build agent executable
         run: cargo build --release --target ${{ matrix.target }}
         working-directory: agent
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Build updater executable
+        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: updater
+
+      - name: Sign binaries (Windows, optional)
+        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_CERT_BASE64 != ''
+        shell: pwsh
+        run: |
+          $certPath = "$env:RUNNER_TEMP\codesign.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_BASE64))
+          $timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+          if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
+            $timestampUrl = "http://timestamp.digicert.com"
+          }
+
+          & signtool sign /f $certPath /p $env:WINDOWS_CODESIGN_CERT_PASSWORD /fd SHA256 /tr $timestampUrl /td SHA256 "agent/target/${{ matrix.target }}/release/${{ matrix.agent_artifact_name }}"
+          & signtool sign /f $certPath /p $env:WINDOWS_CODESIGN_CERT_PASSWORD /fd SHA256 /tr $timestampUrl /td SHA256 "updater/target/${{ matrix.target }}/release/${{ matrix.updater_artifact_name }}"
+
+      - name: Sign binaries (macOS, optional)
+        if: runner.os == 'macOS' && env.MACOS_CODESIGN_CERT_BASE64 != '' && env.MACOS_CODESIGN_IDENTITY != ''
+        shell: bash
+        run: |
+          CERT_PATH="$RUNNER_TEMP/codesign.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/tasknexus-build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+
+          echo "$MACOS_CODESIGN_CERT_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CODESIGN_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --options runtime --timestamp "agent/target/${{ matrix.target }}/release/${{ matrix.agent_artifact_name }}"
+          codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --options runtime --timestamp "updater/target/${{ matrix.target }}/release/${{ matrix.updater_artifact_name }}"
 
       - name: Create dist directory
         run: mkdir -p dist
         shell: bash
 
-      - name: Copy artifact
-        run: cp agent/target/${{ matrix.target }}/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+      - name: Copy artifacts
+        run: |
+          cp "agent/target/${{ matrix.target }}/release/${{ matrix.agent_artifact_name }}" "dist/${{ matrix.agent_asset_name }}"
+          cp "updater/target/${{ matrix.target }}/release/${{ matrix.updater_artifact_name }}" "dist/${{ matrix.updater_asset_name }}"
         shell: bash
 
       - name: Verify build
         run: |
           if [[ "${{ matrix.target }}" != "aarch64"* ]]; then
-            ./dist/${{ matrix.asset_name }} --help
+            ./dist/${{ matrix.agent_asset_name }} --help
+            ./dist/${{ matrix.updater_asset_name }} --help
           fi
         shell: bash
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          name: ${{ matrix.agent_asset_name }}
+          path: |
+            dist/${{ matrix.agent_asset_name }}
+            dist/${{ matrix.updater_asset_name }}
           retention-days: 30
 
       - name: Upload config example (once)
@@ -94,18 +151,91 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    
+    env:
+      MANIFEST_SIGNING_PRIVATE_KEY_B64: ${{ secrets.MANIFEST_SIGNING_PRIVATE_KEY_B64 }}
+      MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
+      - name: Collect release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -maxdepth 3 -type f -print0 | while IFS= read -r -d '' file; do
+            cp "$file" "release-assets/$(basename "$file")"
+          done
+          ls -lah release-assets
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum * > checksums.txt
+
+      - name: Generate manifest.json
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF"].replace("refs/tags/", "", 1)
+          repo = os.environ["GITHUB_REPOSITORY"]
+          key_id = os.environ.get("MANIFEST_SIGNING_KEY_ID", "main") or "main"
+          base_url = f"https://github.com/{repo}/releases/download/{tag}/"
+          checksums_path = Path("release-assets/checksums.txt")
+          manifest_path = Path("release-assets/manifest.json")
+
+          assets = []
+          for line in checksums_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+              continue
+            checksum, name = line.split(maxsplit=1)
+            if name in {"manifest.json", "manifest.sig", "checksums.txt"}:
+              continue
+            assets.append({
+              "name": name,
+              "sha256": checksum,
+              "url": base_url + name,
+            })
+
+          manifest = {
+            "version": tag,
+            "key_id": key_id,
+            "assets": assets,
+          }
+          manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+          )
+          PY
+
+      - name: Sign manifest (Ed25519)
+        shell: bash
+        run: |
+          if [[ -z "$MANIFEST_SIGNING_PRIVATE_KEY_B64" ]]; then
+            echo "MANIFEST_SIGNING_PRIVATE_KEY_B64 secret is required for release signing."
+            exit 1
+          fi
+
+          KEY_PATH="$RUNNER_TEMP/manifest-signing.key"
+          SIG_BIN="$RUNNER_TEMP/manifest.sig.bin"
+          echo "$MANIFEST_SIGNING_PRIVATE_KEY_B64" | base64 --decode > "$KEY_PATH"
+          openssl pkeyutl -sign -inkey "$KEY_PATH" -rawin -in release-assets/manifest.json -out "$SIG_BIN"
+          base64 -w 0 "$SIG_BIN" > release-assets/manifest.sig
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/**/*
+            release-assets/*
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}

@@ -14,9 +14,10 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use tasknexus_agent::{
     autostart::AutoStartManager,
-    client::{AgentClient, TaskDispatchData},
+    client::{AgentClient, AgentUpdateData, TaskDispatchData},
     config::{load_config, AgentConfig},
     executor::TaskRunner,
+    self_update,
 };
 
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
@@ -105,22 +106,26 @@ fn setup_logging(log_level: &str, log_file: Option<&PathBuf>) {
 /// Agent 主结构
 struct Agent {
     config: AgentConfig,
+    config_path: PathBuf,
     task_runner: TaskRunner,
     client: AgentClient,
     /// Maps task_id -> (workspace_name, cancel_sender)
     running_tasks: Arc<RwLock<HashMap<i64, (String, watch::Sender<bool>)>>>,
+    update_in_progress: Arc<RwLock<bool>>,
 }
 
 impl Agent {
-    fn new(config: AgentConfig) -> Self {
+    fn new(config: AgentConfig, config_path: PathBuf) -> Self {
         let task_runner = TaskRunner::new(config.workspaces_path.clone(), config.proxy_env());
         let client = AgentClient::new(config.clone());
 
         Self {
             config,
+            config_path,
             task_runner,
             client,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
+            update_in_progress: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -135,6 +140,7 @@ impl Agent {
         let agent = Arc::new(self);
         let agent_clone = agent.clone();
         let agent_cancel = agent.clone();
+        let agent_update = agent.clone();
 
         // 运行客户端
         agent
@@ -152,6 +158,12 @@ impl Agent {
                         agent.handle_task_cancel(task_id).await;
                     }
                 },
+                move |data| {
+                    let agent = agent_update.clone();
+                    async move {
+                        agent.handle_agent_update(data).await;
+                    }
+                },
                 || info!("Connected to TaskNexus server"),
                 || warn!("Disconnected from TaskNexus server"),
             )
@@ -165,6 +177,18 @@ impl Agent {
         let workspace_name = data.workspace_name.clone();
         let execution_mode = data.execution_mode.clone();
         let command = data.command.clone();
+
+        if *self.update_in_progress.read().await {
+            warn!(
+                "Reject task {} because self-update is currently in progress",
+                task_id
+            );
+            let _ = self
+                .client
+                .send_task_failed(task_id, "Agent is updating; task rejected".to_string())
+                .await;
+            return;
+        }
 
         if execution_mode == "code" {
             let language = data
@@ -375,6 +399,101 @@ impl Agent {
         }
         warn!("Task {} not found in running tasks, cannot cancel", task_id);
     }
+
+    async fn handle_agent_update(&self, data: AgentUpdateData) {
+        let task_id = data.task_id;
+
+        {
+            let mut flag = self.update_in_progress.write().await;
+            if *flag {
+                warn!(
+                    "Ignore duplicate self-update task {} because update is already running",
+                    task_id
+                );
+                let _ = self
+                    .client
+                    .send_task_failed(task_id, "Self-update already running".to_string())
+                    .await;
+                return;
+            }
+            *flag = true;
+        }
+
+        let running_count = self.running_tasks.read().await.len();
+        if running_count > 0 {
+            let _ = self
+                .client
+                .send_task_failed(
+                    task_id,
+                    format!(
+                        "Cannot update while {} task(s) are still running",
+                        running_count
+                    ),
+                )
+                .await;
+            *self.update_in_progress.write().await = false;
+            return;
+        }
+
+        if let Err(e) = self.client.send_task_started(task_id).await {
+            error!(
+                "Failed to report self-update start for task {}: {}",
+                task_id, e
+            );
+        }
+
+        let _ = self
+            .client
+            .send_task_progress(
+                task_id,
+                "Starting self-update from latest release".to_string(),
+            )
+            .await;
+
+        match self_update::perform_self_update(&self.config_path).await {
+            Ok(update_result) => {
+                let _ = self
+                    .client
+                    .send_task_progress(
+                        task_id,
+                        format!(
+                            "Updater launched successfully for version {}. Agent will restart now.",
+                            update_result.target_version
+                        ),
+                    )
+                    .await;
+
+                let mut result = HashMap::new();
+                result.insert(
+                    "target_version".to_string(),
+                    serde_json::Value::String(update_result.target_version),
+                );
+
+                if let Err(e) = self
+                    .client
+                    .send_task_completed(task_id, 0, String::new(), String::new(), result)
+                    .await
+                {
+                    error!(
+                        "Failed to report self-update completion for task {}: {}",
+                        task_id, e
+                    );
+                }
+
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                std::process::exit(0);
+            }
+            Err(e) => {
+                error!("Self-update task {} failed: {}", task_id, e);
+                let _ = self
+                    .client
+                    .send_task_failed(task_id, format!("Self-update failed: {}", e))
+                    .await;
+            }
+        }
+
+        *self.update_in_progress.write().await = false;
+    }
 }
 
 #[tokio::main]
@@ -406,7 +525,7 @@ async fn main() {
     apply_autostart_from_config(&config, &config_path);
 
     // 创建并运行 Agent
-    let agent = Agent::new(config);
+    let agent = Agent::new(config, config_path);
 
     if let Err(e) = agent.start().await {
         error!("Agent 运行失败: {}", e);

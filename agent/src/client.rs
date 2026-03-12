@@ -60,6 +60,9 @@ pub enum ServerMessage {
     TaskCancel {
         task_id: i64,
     },
+    AgentUpdate {
+        task_id: i64,
+    },
 }
 
 fn default_ref() -> String {
@@ -117,6 +120,11 @@ pub struct TaskDispatchData {
     pub client_repo_token: Option<String>,
     pub timeout: u64,
     pub environment: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentUpdateData {
+    pub task_id: i64,
 }
 
 /// WebSocket 客户端
@@ -246,10 +254,11 @@ impl AgentClient {
     }
 
     /// 运行客户端主循环
-    pub async fn run<F, G, Fut1, Fut2>(
+    pub async fn run<F, G, H, Fut1, Fut2, Fut3>(
         &self,
         on_task_dispatch: F,
         on_task_cancel: G,
+        on_agent_update: H,
         on_connected: impl Fn() + Send + Sync + 'static,
         on_disconnected: impl Fn() + Send + Sync + 'static,
     ) -> Result<()>
@@ -258,6 +267,8 @@ impl AgentClient {
         Fut1: std::future::Future<Output = ()> + Send + 'static,
         G: Fn(i64) -> Fut2 + Send + Sync + Clone + 'static,
         Fut2: std::future::Future<Output = ()> + Send,
+        H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + Clone + 'static,
+        Fut3: std::future::Future<Output = ()> + Send + 'static,
     {
         *self.running.write().await = true;
 
@@ -266,6 +277,7 @@ impl AgentClient {
                 .message_loop(
                     on_task_dispatch.clone(),
                     on_task_cancel.clone(),
+                    on_agent_update.clone(),
                     &on_connected,
                 )
                 .await
@@ -323,10 +335,11 @@ impl AgentClient {
     }
 
     /// 消息接收循环
-    async fn message_loop<F, G, Fut1, Fut2>(
+    async fn message_loop<F, G, H, Fut1, Fut2, Fut3>(
         &self,
         on_task_dispatch: F,
         on_task_cancel: G,
+        on_agent_update: H,
         on_connected: &(dyn Fn() + Send + Sync),
     ) -> Result<()>
     where
@@ -334,6 +347,8 @@ impl AgentClient {
         Fut1: std::future::Future<Output = ()> + Send + 'static,
         G: Fn(i64) -> Fut2 + Send + Sync + Clone + 'static,
         Fut2: std::future::Future<Output = ()> + Send,
+        H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + Clone + 'static,
+        Fut3: std::future::Future<Output = ()> + Send + 'static,
     {
         let url = self.ws_url()?;
         info!("Connecting to {}...", self.config.server);
@@ -438,6 +453,7 @@ impl AgentClient {
                             server_msg,
                             on_task_dispatch.clone(),
                             on_task_cancel.clone(),
+                            on_agent_update.clone(),
                         )
                         .await;
                     }
@@ -471,16 +487,19 @@ impl AgentClient {
     }
 
     /// 处理接收到的消息
-    async fn handle_message<F, G, Fut1, Fut2>(
+    async fn handle_message<F, G, H, Fut1, Fut2, Fut3>(
         &self,
         message: ServerMessage,
         on_task_dispatch: F,
         on_task_cancel: G,
+        on_agent_update: H,
     ) where
         F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + 'static,
         Fut1: std::future::Future<Output = ()> + Send + 'static,
         G: Fn(i64) -> Fut2 + Send + Sync,
         Fut2: std::future::Future<Output = ()> + Send,
+        H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + 'static,
+        Fut3: std::future::Future<Output = ()> + Send + 'static,
     {
         match message {
             ServerMessage::Connected { message } => {
@@ -526,6 +545,13 @@ impl AgentClient {
             ServerMessage::TaskCancel { task_id } => {
                 info!("Received task cancel: {}", task_id);
                 on_task_cancel(task_id).await;
+            }
+            ServerMessage::AgentUpdate { task_id } => {
+                info!("Received self-update task {}", task_id);
+                let data = AgentUpdateData { task_id };
+                tokio::spawn(async move {
+                    on_agent_update(data).await;
+                });
             }
         }
     }

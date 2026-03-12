@@ -23,35 +23,35 @@ impl AutoStartManager {
         config_path: Option<&PathBuf>,
         extra_args: Option<&[String]>,
     ) -> Result<Self, String> {
-        let current_exe = std::env::current_exe()
-            .map_err(|e| format!("无法获取当前可执行文件路径: {}", e))?;
-        
+        let current_exe =
+            std::env::current_exe().map_err(|e| format!("无法获取当前可执行文件路径: {}", e))?;
+
         let app_path = current_exe.to_string_lossy().to_string();
-        
+
         // 构建启动参数
         let mut args: Vec<String> = Vec::new();
-        
+
         // 添加配置文件参数
         if let Some(config) = config_path {
             let config_str = config.to_string_lossy().to_string();
             args.push("--config".to_string());
             args.push(config_str);
         }
-        
+
         // 添加额外参数
         if let Some(extra) = extra_args {
             args.extend(extra.iter().cloned());
         }
-        
+
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        
+
         let auto_launch = AutoLaunchBuilder::new()
             .set_app_name(app_name)
             .set_app_path(&app_path)
             .set_args(&args_refs)
             .build()
             .map_err(|e| format!("创建自启动管理器失败: {}", e))?;
-        
+
         Ok(Self { auto_launch })
     }
 
@@ -60,7 +60,7 @@ impl AutoStartManager {
         self.auto_launch
             .enable()
             .map_err(|e| format!("启用开机自启动失败: {}", e))?;
-        
+
         info!("开机自启动已启用");
         Ok(())
     }
@@ -70,7 +70,7 @@ impl AutoStartManager {
         self.auto_launch
             .disable()
             .map_err(|e| format!("禁用开机自启动失败: {}", e))?;
-        
+
         info!("开机自启动已禁用");
         Ok(())
     }
