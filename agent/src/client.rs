@@ -94,6 +94,7 @@ pub enum ClientMessage {
     TaskProgress {
         task_id: i64,
         output: String,
+        is_stderr: bool,
     },
     TaskCompleted {
         task_id: i64,
@@ -223,8 +224,17 @@ impl AgentClient {
     }
 
     /// 发送任务进度更新
-    pub async fn send_task_progress(&self, task_id: i64, output: String) -> Result<()> {
-        self.send_log_message(ClientMessage::TaskProgress { task_id, output })
+    pub async fn send_task_progress(
+        &self,
+        task_id: i64,
+        output: String,
+        is_stderr: bool,
+    ) -> Result<()> {
+        self.send_log_message(ClientMessage::TaskProgress {
+            task_id,
+            output,
+            is_stderr,
+        })
             .await
     }
 

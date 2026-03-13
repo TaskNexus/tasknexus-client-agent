@@ -22,6 +22,11 @@ use tasknexus_agent::{
 
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
 
+struct BufferedLogEvent {
+    output: String,
+    is_stderr: bool,
+}
+
 fn split_log_chunks(input: &str, max_chunk_bytes: usize) -> Vec<String> {
     if input.is_empty() {
         return Vec::new();
@@ -253,19 +258,22 @@ impl Agent {
         });
 
         // 创建日志缓冲区，按批次发送（每 500ms）
-        let log_buffer: Arc<tokio::sync::Mutex<Vec<String>>> =
+        let log_buffer: Arc<tokio::sync::Mutex<Vec<BufferedLogEvent>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         // 输出回调 — 只缓冲日志行，不立即发送
         let buffer_for_callback = log_buffer.clone();
-        let output_callback = move |line: String, _is_stderr: bool| {
+        let output_callback = move |line: String, is_stderr: bool| {
             let buffer = buffer_for_callback.clone();
             let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
             async move {
                 buffer
                     .lock()
                     .await
-                    .push(format!("[{}] {}", timestamp, line));
+                    .push(BufferedLogEvent {
+                        output: format!("[{}] {}", timestamp, line),
+                        is_stderr,
+                    });
             }
         };
 
@@ -278,11 +286,14 @@ impl Agent {
                 tick.tick().await;
                 let mut buf = flush_buffer.lock().await;
                 if !buf.is_empty() {
-                    let batch = buf.join("\n");
-                    buf.clear();
+                    let events = std::mem::take(&mut *buf);
                     drop(buf); // 释放锁再 await
-                    for chunk in split_log_chunks(&batch, MAX_LOG_CHUNK_BYTES) {
-                        let _ = flush_client.send_task_progress(task_id, chunk).await;
+                    for event in events {
+                        for chunk in split_log_chunks(&event.output, MAX_LOG_CHUNK_BYTES) {
+                            let _ = flush_client
+                                .send_task_progress(task_id, chunk, event.is_stderr)
+                                .await;
+                        }
                     }
                 }
             }
@@ -321,11 +332,15 @@ impl Agent {
         {
             let mut buf = log_buffer.lock().await;
             if !buf.is_empty() {
-                let batch = buf.join("\n");
-                buf.clear();
+                let events = std::mem::take(&mut *buf);
                 drop(buf);
-                for chunk in split_log_chunks(&batch, MAX_LOG_CHUNK_BYTES) {
-                    let _ = self.client.send_task_progress(task_id, chunk).await;
+                for event in events {
+                    for chunk in split_log_chunks(&event.output, MAX_LOG_CHUNK_BYTES) {
+                        let _ = self
+                            .client
+                            .send_task_progress(task_id, chunk, event.is_stderr)
+                            .await;
+                    }
                 }
             }
         }
@@ -449,6 +464,7 @@ impl Agent {
             .send_task_progress(
                 task_id,
                 "Starting self-update from latest release".to_string(),
+                false,
             )
             .await;
 
@@ -462,6 +478,7 @@ impl Agent {
                             "Updater launched successfully for version {}. Agent will restart now.",
                             update_result.target_version
                         ),
+                        false,
                     )
                     .await;
 

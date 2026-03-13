@@ -7,11 +7,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 /// Magic markers for structured result extraction from stdout
 const RESULT_BEGIN_MARKER: &str = "##TASKNEXUS_RESULT_BEGIN##";
@@ -100,6 +102,29 @@ fn extract_result(raw_stdout: &str) -> (String, HashMap<String, serde_json::Valu
     (raw_stdout.to_string(), HashMap::new())
 }
 
+fn split_stream_chunks(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<String> {
+    let mut result = Vec::new();
+
+    for byte in incoming {
+        pending.push(*byte);
+        if *byte == b'\n' || *byte == b'\r' {
+            result.push(String::from_utf8_lossy(pending).to_string());
+            pending.clear();
+        }
+    }
+
+    result
+}
+
+fn flush_stream_buffer(pending: &mut Vec<u8>) -> Option<String> {
+    if pending.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(pending).to_string();
+    pending.clear();
+    Some(text)
+}
+
 /// 命令执行器
 pub struct CommandExecutor {
     default_timeout: u64,
@@ -166,7 +191,7 @@ impl CommandExecutor {
         let shell_args: Vec<&str> = match shell_name {
             "zsh" | "bash" => vec!["-l", "-c"],
             "sh" => vec!["-c"],
-            "cmd" | "cmd.exe" => vec!["/C"],
+            "cmd" | "cmd.exe" => vec!["/S", "/C"],
             "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => vec!["-Command"],
             _ => vec!["-c"],
         };
@@ -185,7 +210,18 @@ impl CommandExecutor {
         #[cfg(not(windows))]
         let actual_cmd = command;
 
-        cmd.args(&shell_args).arg(&actual_cmd);
+        #[cfg(windows)]
+        {
+            if shell_name == "cmd" || shell_name == "cmd.exe" {
+                cmd.args(&shell_args).raw_arg(&actual_cmd);
+            } else {
+                cmd.args(&shell_args).arg(&actual_cmd);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            cmd.args(&shell_args).arg(&actual_cmd);
+        }
 
         if let Some(dir) = working_dir {
             cmd.current_dir(dir);
@@ -225,7 +261,6 @@ impl CommandExecutor {
         // 在 Windows 上使用 CREATE_NO_WINDOW 标志
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
@@ -251,9 +286,6 @@ impl CommandExecutor {
         let mut stdout_reader = BufReader::new(stdout);
         let mut stderr_reader = BufReader::new(stderr);
 
-        let stdout_chunks: Vec<String> = Vec::new();
-        let _stderr_chunks: Vec<String> = Vec::new();
-
         // 创建输出通道
         let (tx, mut rx) = mpsc::channel::<(String, bool)>(100);
         let tx_stdout = tx.clone();
@@ -261,36 +293,66 @@ impl CommandExecutor {
 
         // 读取 stdout
         let stdout_handle = tokio::spawn(async move {
-            let mut lines = Vec::new();
-            let mut buffer = Vec::new();
-            while let Ok(n) = stdout_reader.read_until(b'\n', &mut buffer).await {
+            let mut chunks = Vec::new();
+            let mut read_buffer = [0u8; 4096];
+            let mut pending = Vec::new();
+
+            loop {
+                let n = match stdout_reader.read(&mut read_buffer).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        warn!("Failed to read stdout: {}", err);
+                        break;
+                    }
+                };
                 if n == 0 {
                     break;
                 }
-                let line_str = String::from_utf8_lossy(&buffer).trim_end().to_string();
-                let params = (line_str.clone(), false);
-                let _ = tx_stdout.send(params).await;
-                lines.push(line_str);
-                buffer.clear();
+
+                for chunk in split_stream_chunks(&mut pending, &read_buffer[..n]) {
+                    let _ = tx_stdout.send((chunk.clone(), false)).await;
+                    chunks.push(chunk);
+                }
             }
-            lines
+
+            if let Some(tail) = flush_stream_buffer(&mut pending) {
+                let _ = tx_stdout.send((tail.clone(), false)).await;
+                chunks.push(tail);
+            }
+
+            chunks
         });
 
         // 读取 stderr
         let stderr_handle = tokio::spawn(async move {
-            let mut lines = Vec::new();
-            let mut buffer = Vec::new();
-            while let Ok(n) = stderr_reader.read_until(b'\n', &mut buffer).await {
+            let mut chunks = Vec::new();
+            let mut read_buffer = [0u8; 4096];
+            let mut pending = Vec::new();
+
+            loop {
+                let n = match stderr_reader.read(&mut read_buffer).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        warn!("Failed to read stderr: {}", err);
+                        break;
+                    }
+                };
                 if n == 0 {
                     break;
                 }
-                let line_str = String::from_utf8_lossy(&buffer).trim_end().to_string();
-                let params = (line_str.clone(), true);
-                let _ = tx_stderr.send(params).await;
-                lines.push(line_str);
-                buffer.clear();
+
+                for chunk in split_stream_chunks(&mut pending, &read_buffer[..n]) {
+                    let _ = tx_stderr.send((chunk.clone(), true)).await;
+                    chunks.push(chunk);
+                }
             }
-            lines
+
+            if let Some(tail) = flush_stream_buffer(&mut pending) {
+                let _ = tx_stderr.send((tail.clone(), true)).await;
+                chunks.push(tail);
+            }
+
+            chunks
         });
 
         // 处理输出回调
@@ -322,16 +384,16 @@ impl CommandExecutor {
             tokio::select! {
                 result = timed_future => {
                     match result {
-                        Ok((stdout_lines, stderr_lines, status)) => {
+                        Ok((stdout_parts, stderr_parts, status)) => {
                             let exit_code = status
                                 .map(|s| s.code().unwrap_or(-1))
                                 .unwrap_or(-1);
-                            let raw_stdout = stdout_lines.join("\n");
+                            let raw_stdout = stdout_parts.concat();
                             let (stdout, result) = extract_result(&raw_stdout);
                             ExecutionResult {
                                 exit_code,
                                 stdout,
-                                stderr: stderr_lines.join("\n"),
+                                stderr: stderr_parts.concat(),
                                 timed_out: false,
                                 cancelled: false,
                                 result,
@@ -342,7 +404,7 @@ impl CommandExecutor {
                             kill_process_tree(&mut child).await;
                             ExecutionResult {
                                 exit_code: -1,
-                                stdout: stdout_chunks.join("\n"),
+                                stdout: String::new(),
                                 stderr: format!("Command timed out after {} seconds", timeout_secs),
                                 timed_out: true,
                                 cancelled: false,
@@ -356,7 +418,7 @@ impl CommandExecutor {
                     kill_process_tree(&mut child).await;
                     ExecutionResult {
                         exit_code: -1,
-                        stdout: stdout_chunks.join("\n"),
+                        stdout: String::new(),
                         stderr: "Task was cancelled".to_string(),
                         timed_out: false,
                         cancelled: true,
@@ -368,14 +430,14 @@ impl CommandExecutor {
             // No cancellation - original behavior
             let result = timed_future.await;
             match result {
-                Ok((stdout_lines, stderr_lines, status)) => {
+                Ok((stdout_parts, stderr_parts, status)) => {
                     let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                    let raw_stdout = stdout_lines.join("\n");
+                    let raw_stdout = stdout_parts.concat();
                     let (stdout, result) = extract_result(&raw_stdout);
                     ExecutionResult {
                         exit_code,
                         stdout,
-                        stderr: stderr_lines.join("\n"),
+                        stderr: stderr_parts.concat(),
                         timed_out: false,
                         cancelled: false,
                         result,
@@ -386,7 +448,7 @@ impl CommandExecutor {
                     kill_process_tree(&mut child).await;
                     ExecutionResult {
                         exit_code: -1,
-                        stdout: stdout_chunks.join("\n"),
+                        stdout: String::new(),
                         stderr: format!("Command timed out after {} seconds", timeout_secs),
                         timed_out: true,
                         cancelled: false,
@@ -766,18 +828,49 @@ impl TaskRunner {
 
     /// 根据脚本路径的扩展名生成执行命令
     fn build_script_command(script_path: &str) -> String {
-        let ext = script_path.rsplit('.').next().unwrap_or("");
+        let normalized_path = Self::normalize_script_path(script_path);
+        let ext = normalized_path.rsplit('.').next().unwrap_or("");
         match ext {
             "py" => {
-                let quoted_path = Self::quote_raw_arg(script_path);
+                let quoted_path = Self::quote_raw_arg(&normalized_path);
                 Self::build_python_command_with_quoted_path(&quoted_path)
             }
-            "sh" => format!("bash {}", script_path),
-            "js" => format!("node {}", script_path),
-            "ts" => format!("npx ts-node {}", script_path),
-            "rb" => format!("ruby {}", script_path),
-            _ => script_path.to_string(),
+            "sh" => format!("bash {}", normalized_path),
+            "js" => format!("node {}", normalized_path),
+            "ts" => format!("npx ts-node {}", normalized_path),
+            "rb" => format!("ruby {}", normalized_path),
+            _ => normalized_path,
         }
+    }
+
+    fn normalize_script_path(script_path: &str) -> String {
+        let mut normalized = script_path.trim().to_string();
+        normalized = normalized.replace("\\\"", "\"");
+
+        if normalized.len() >= 2 {
+            let first = normalized.as_bytes()[0] as char;
+            let last = normalized.as_bytes()[normalized.len() - 1] as char;
+            if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+                normalized = normalized[1..normalized.len() - 1].to_string();
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            while normalized.starts_with("./") || normalized.starts_with(".\\") {
+                normalized = normalized[2..].to_string();
+            }
+
+            if (normalized.starts_with('\\') || normalized.starts_with('/'))
+                && !Path::new(&normalized).is_absolute()
+            {
+                normalized = normalized
+                    .trim_start_matches(|ch| ch == '\\' || ch == '/')
+                    .to_string();
+            }
+        }
+
+        normalized.trim().to_string()
     }
 
     fn build_python_command_with_quoted_path(quoted_path: &str) -> String {
