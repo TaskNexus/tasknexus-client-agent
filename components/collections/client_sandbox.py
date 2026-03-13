@@ -356,8 +356,8 @@ class ClientSandboxService(Service):
                 type='string',
                 required=True,
                 schema=ExtendedStringSchema(
-                    description='Select a registered client agent',
-                    param_type='select',
+                    description='Type or select a registered client agent',
+                    param_type='editable_select',
                     enum=self._get_registered_client_agents(),
                 ),
             ),

@@ -714,7 +714,8 @@ impl TaskRunner {
         if result.exit_code != 0 {
             error!("Command failed with exit code {}", result.exit_code);
             if !result.stderr.is_empty() {
-                error!("stderr: {}", &result.stderr[..result.stderr.len().min(500)]);
+                let stderr_preview: String = result.stderr.chars().take(500).collect();
+                error!("stderr: {}", stderr_preview);
             }
         }
 
