@@ -582,15 +582,22 @@ impl Agent {
         log_flush_task.abort();
         heartbeat_task.abort();
 
-        {
+        let (local_log_flush_succeeded, local_log_path) = {
             let mut guard = log_sync_state.lock().await;
-            if let Err(e) = guard.finalize_pending() {
+            let finalize_ok = if let Err(e) = guard.finalize_pending() {
                 error!("Failed to finalize task log state for {}: {}", task_id, e);
-            }
-            if let Err(e) = guard.sync_with_server(&self.client, true, true).await {
+                false
+            } else {
+                true
+            };
+            let sync_ok = if let Err(e) = guard.sync_with_server(&self.client, true, true).await {
                 warn!("Failed to flush task logs for {}: {}", task_id, e);
-            }
-        }
+                false
+            } else {
+                true
+            };
+            (finalize_ok && sync_ok, guard.local_log_path.clone())
+        };
 
         // 发送结果
         if result.cancelled {
@@ -643,6 +650,25 @@ impl Agent {
             warn!(
                 "Task {} failed with exit code {}",
                 task_id, result.exit_code
+            );
+        }
+
+        if local_log_flush_succeeded {
+            if let Err(e) = fs::remove_file(&local_log_path) {
+                warn!(
+                    "Failed to cleanup local task log for {} at {:?}: {}",
+                    task_id, local_log_path, e
+                );
+            } else {
+                info!(
+                    "Cleaned up local task log for {} at {:?}",
+                    task_id, local_log_path
+                );
+            }
+        } else {
+            warn!(
+                "Keeping local task log for {} at {:?} because final log flush did not complete successfully",
+                task_id, local_log_path
             );
         }
 
