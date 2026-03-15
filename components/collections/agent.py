@@ -266,9 +266,11 @@ class ClientAgentService(Service):
                     miss_count = 0
                     data.set_outputs('_hb_last_seen_heartbeat', current_heartbeat_iso)
 
-                if current_heartbeat:
-                    heartbeat_elapsed = (timezone.now() - current_heartbeat).total_seconds()
-                    if heartbeat_elapsed > HEARTBEAT_TIMEOUT_SECONDS:
+                activity_reference = current_heartbeat or getattr(task, 'started_at', None)
+
+                if activity_reference:
+                    activity_elapsed = (timezone.now() - activity_reference).total_seconds()
+                    if activity_elapsed > HEARTBEAT_TIMEOUT_SECONDS:
                         miss_count += 1
                         data.set_outputs('_hb_timeout_miss_count', miss_count)
                         if miss_count >= HEARTBEAT_TIMEOUT_RETRY:
@@ -288,7 +290,7 @@ class ClientAgentService(Service):
                             miss_count = 0
                         data.set_outputs('_hb_timeout_miss_count', miss_count)
                 else:
-                    # 尚无心跳，不累计失败次数
+                    # started_at 也不存在时，回退到原来的等待逻辑
                     if miss_count != 0:
                         miss_count = 0
                     data.set_outputs('_hb_timeout_miss_count', miss_count)

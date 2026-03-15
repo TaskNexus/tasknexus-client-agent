@@ -96,6 +96,23 @@ pub enum ClientMessage {
         output: String,
         is_stderr: bool,
     },
+    TaskLogAppend {
+        task_id: i64,
+        start_offset: u64,
+        content: String,
+    },
+    TaskLogActive {
+        task_id: i64,
+        seq: u64,
+        base_offset: u64,
+        line: String,
+        is_stderr: bool,
+    },
+    TaskLogActiveClear {
+        task_id: i64,
+        seq: u64,
+        base_offset: u64,
+    },
     TaskCompleted {
         task_id: i64,
         exit_code: i32,
@@ -179,8 +196,9 @@ impl AgentClient {
             })?;
             return Ok(());
         }
-        warn!("Cannot send control message: not connected");
-        Ok(())
+        Err(AgentError::Connection(
+            "Cannot send control message: not connected".to_string(),
+        ))
     }
 
     async fn send_log_message(&self, message: ClientMessage) -> Result<()> {
@@ -191,8 +209,9 @@ impl AgentClient {
             })?;
             return Ok(());
         }
-        warn!("Cannot send log message: not connected");
-        Ok(())
+        Err(AgentError::Connection(
+            "Cannot send log message: not connected".to_string(),
+        ))
     }
 
     /// 发送消息到服务器
@@ -201,6 +220,9 @@ impl AgentClient {
         if matches!(
             message,
             ClientMessage::TaskProgress { .. }
+                | ClientMessage::TaskLogAppend { .. }
+                | ClientMessage::TaskLogActive { .. }
+                | ClientMessage::TaskLogActiveClear { .. }
                 | ClientMessage::TaskCompleted { .. }
                 | ClientMessage::TaskFailed { .. }
         ) {
@@ -235,7 +257,53 @@ impl AgentClient {
             output,
             is_stderr,
         })
-            .await
+        .await
+    }
+
+    pub async fn send_task_log_append(
+        &self,
+        task_id: i64,
+        start_offset: u64,
+        content: String,
+    ) -> Result<()> {
+        self.send_log_message(ClientMessage::TaskLogAppend {
+            task_id,
+            start_offset,
+            content,
+        })
+        .await
+    }
+
+    pub async fn send_task_log_active(
+        &self,
+        task_id: i64,
+        seq: u64,
+        base_offset: u64,
+        line: String,
+        is_stderr: bool,
+    ) -> Result<()> {
+        self.send_log_message(ClientMessage::TaskLogActive {
+            task_id,
+            seq,
+            base_offset,
+            line,
+            is_stderr,
+        })
+        .await
+    }
+
+    pub async fn send_task_log_active_clear(
+        &self,
+        task_id: i64,
+        seq: u64,
+        base_offset: u64,
+    ) -> Result<()> {
+        self.send_log_message(ClientMessage::TaskLogActiveClear {
+            task_id,
+            seq,
+            base_offset,
+        })
+        .await
     }
 
     /// 发送任务完成通知

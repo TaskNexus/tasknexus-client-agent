@@ -12,8 +12,6 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 /// Magic markers for structured result extraction from stdout
 const RESULT_BEGIN_MARKER: &str = "##TASKNEXUS_RESULT_BEGIN##";
@@ -61,13 +59,6 @@ fn resolve_shell_name(environment: Option<&HashMap<String, String>>) -> String {
 
 fn is_cmd_shell(shell_name: &str) -> bool {
     matches!(shell_name, "cmd" | "cmd.exe")
-}
-
-fn is_powershell_shell(shell_name: &str) -> bool {
-    matches!(
-        shell_name,
-        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
-    )
 }
 
 /// 杀死进程及其所有子进程
@@ -915,7 +906,7 @@ impl TaskRunner {
         let auth_url = Self::inject_token_into_url(repo_url, token);
 
         let clone_cmd = format!(
-            "git clone --depth 1 --branch {} {} {}",
+            "git clone --progress --depth 1 --branch {} {} {}",
             ref_name, auth_url, repo_name
         );
 

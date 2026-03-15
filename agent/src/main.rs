@@ -5,10 +5,12 @@
 use chrono::Local;
 use clap::Parser;
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::sync::{watch, Mutex, RwLock};
+use tokio::time::{interval, Duration, Instant};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -21,40 +23,296 @@ use tasknexus_agent::{
 };
 
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
+const LOG_APPEND_INTERVAL_MS: u64 = 500;
+const LOG_ACTIVE_DEBOUNCE_MS: u64 = 125;
+const TASK_LOG_DIR_NAME: &str = ".tasknexus_task_logs";
 
-struct BufferedLogEvent {
-    output: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisibleLine {
+    text: String,
     is_stderr: bool,
 }
 
-fn split_log_chunks(input: &str, max_chunk_bytes: usize) -> Vec<String> {
-    if input.is_empty() {
-        return Vec::new();
+#[derive(Clone, Debug)]
+enum PendingActiveEventKind {
+    Set(VisibleLine),
+    Clear,
+}
+
+#[derive(Clone, Debug)]
+struct PendingActiveEvent {
+    seq: u64,
+    kind: PendingActiveEventKind,
+}
+
+struct TaskLogSyncState {
+    task_id: i64,
+    local_log_path: PathBuf,
+    committed_offset: u64,
+    synced_offset: u64,
+    line_timestamp: Option<String>,
+    line_buffer: String,
+    line_is_stderr: bool,
+    active_display: Option<VisibleLine>,
+    pending_active_event: Option<PendingActiveEvent>,
+    next_active_seq: u64,
+    last_append_flush: Instant,
+    last_active_change: Option<Instant>,
+}
+
+impl TaskLogSyncState {
+    fn new(workspaces_path: &PathBuf, task_id: i64) -> std::io::Result<Self> {
+        let log_dir = workspaces_path.join(TASK_LOG_DIR_NAME);
+        fs::create_dir_all(&log_dir)?;
+        let local_log_path = log_dir.join(format!("task_{}.log", task_id));
+        File::create(&local_log_path)?;
+
+        Ok(Self {
+            task_id,
+            local_log_path,
+            committed_offset: 0,
+            synced_offset: 0,
+            line_timestamp: None,
+            line_buffer: String::new(),
+            line_is_stderr: false,
+            active_display: None,
+            pending_active_event: None,
+            next_active_seq: 0,
+            last_append_flush: Instant::now(),
+            last_active_change: None,
+        })
     }
 
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let total_len = input.len();
-
-    while start < total_len {
-        let mut end = std::cmp::min(start + max_chunk_bytes, total_len);
-        while end > start && !input.is_char_boundary(end) {
-            end -= 1;
-        }
-
-        if end == start {
-            if let Some((offset, _)) = input[start..].char_indices().nth(1) {
-                end = start + offset;
-            } else {
-                end = total_len;
+    fn ingest_chunk(&mut self, chunk: &str, is_stderr: bool) -> std::io::Result<()> {
+        for ch in chunk.chars() {
+            match ch {
+                '\r' => {
+                    if !self.line_buffer.is_empty() {
+                        self.refresh_active_from_buffer();
+                        self.line_buffer.clear();
+                    }
+                }
+                '\n' => {
+                    if !self.line_buffer.is_empty() {
+                        let visible = self
+                            .build_visible_from_buffer()
+                            .unwrap_or_else(|| self.build_blank_visible(is_stderr));
+                        self.commit_visible_line(visible)?;
+                    } else if let Some(visible) = self.active_display.clone() {
+                        self.commit_visible_line(visible)?;
+                    } else {
+                        let visible = self.build_blank_visible(is_stderr);
+                        self.commit_visible_line(visible)?;
+                    }
+                    self.reset_line_state();
+                }
+                _ => {
+                    self.ensure_line_timestamp();
+                    if self.line_buffer.is_empty() {
+                        self.line_is_stderr = is_stderr;
+                    }
+                    self.line_buffer.push(ch);
+                    self.refresh_active_from_buffer();
+                }
             }
         }
 
-        chunks.push(input[start..end].to_string());
-        start = end;
+        Ok(())
     }
 
-    chunks
+    fn finalize_pending(&mut self) -> std::io::Result<()> {
+        if !self.line_buffer.is_empty() {
+            if let Some(visible) = self.build_visible_from_buffer() {
+                self.commit_visible_line(visible)?;
+            }
+            self.reset_line_state();
+            return Ok(());
+        }
+
+        if let Some(visible) = self.active_display.clone() {
+            self.commit_visible_line(visible)?;
+            self.reset_line_state();
+        }
+
+        Ok(())
+    }
+
+    async fn sync_with_server(
+        &mut self,
+        client: &AgentClient,
+        force_append: bool,
+        force_active: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let backlog = self.committed_offset.saturating_sub(self.synced_offset);
+        let should_flush_append = backlog > 0
+            && (force_append
+                || backlog >= MAX_LOG_CHUNK_BYTES as u64
+                || self.last_append_flush.elapsed()
+                    >= Duration::from_millis(LOG_APPEND_INTERVAL_MS));
+
+        if should_flush_append {
+            loop {
+                if self.synced_offset >= self.committed_offset {
+                    break;
+                }
+
+                let (content, byte_len) = read_utf8_chunk(
+                    &self.local_log_path,
+                    self.synced_offset,
+                    MAX_LOG_CHUNK_BYTES,
+                )?;
+                if byte_len == 0 || content.is_empty() {
+                    break;
+                }
+
+                client
+                    .send_task_log_append(self.task_id, self.synced_offset, content)
+                    .await?;
+                self.synced_offset += byte_len as u64;
+                self.last_append_flush = Instant::now();
+
+                if !force_append && self.synced_offset < self.committed_offset {
+                    continue;
+                }
+            }
+        }
+
+        if self.synced_offset != self.committed_offset {
+            return Ok(());
+        }
+
+        let should_flush_active = if let Some(last_change) = self.last_active_change {
+            force_active || last_change.elapsed() >= Duration::from_millis(LOG_ACTIVE_DEBOUNCE_MS)
+        } else {
+            false
+        };
+
+        if !should_flush_active {
+            return Ok(());
+        }
+
+        let pending = match self.pending_active_event.clone() {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+
+        match pending.kind {
+            PendingActiveEventKind::Set(visible) => {
+                client
+                    .send_task_log_active(
+                        self.task_id,
+                        pending.seq,
+                        self.synced_offset,
+                        visible.text.clone(),
+                        visible.is_stderr,
+                    )
+                    .await?;
+            }
+            PendingActiveEventKind::Clear => {
+                client
+                    .send_task_log_active_clear(self.task_id, pending.seq, self.synced_offset)
+                    .await?;
+            }
+        }
+
+        self.pending_active_event = None;
+        self.last_active_change = None;
+        Ok(())
+    }
+
+    fn ensure_line_timestamp(&mut self) {
+        if self.line_timestamp.is_none() {
+            self.line_timestamp = Some(Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string());
+        }
+    }
+
+    fn refresh_active_from_buffer(&mut self) {
+        let visible = self.build_visible_from_buffer();
+        self.update_active_display(visible);
+    }
+
+    fn build_visible_from_buffer(&self) -> Option<VisibleLine> {
+        let timestamp = self.line_timestamp.as_ref()?;
+        Some(VisibleLine {
+            text: format!("[{}] {}", timestamp, self.line_buffer),
+            is_stderr: self.line_is_stderr,
+        })
+    }
+
+    fn build_blank_visible(&self, is_stderr: bool) -> VisibleLine {
+        let timestamp = self
+            .line_timestamp
+            .clone()
+            .unwrap_or_else(|| Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string());
+        VisibleLine {
+            text: format!("[{}] ", timestamp),
+            is_stderr,
+        }
+    }
+
+    fn commit_visible_line(&mut self, visible: VisibleLine) -> std::io::Result<()> {
+        let record = format!("{}\n", visible.text);
+        let bytes = record.as_bytes();
+        let mut file = OpenOptions::new().append(true).open(&self.local_log_path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        self.committed_offset += bytes.len() as u64;
+        self.update_active_display(None);
+        Ok(())
+    }
+
+    fn reset_line_state(&mut self) {
+        self.line_timestamp = None;
+        self.line_buffer.clear();
+        self.line_is_stderr = false;
+    }
+
+    fn update_active_display(&mut self, next: Option<VisibleLine>) {
+        if self.active_display == next {
+            return;
+        }
+
+        self.active_display = next.clone();
+        self.next_active_seq += 1;
+        self.pending_active_event = Some(PendingActiveEvent {
+            seq: self.next_active_seq,
+            kind: match next {
+                Some(visible) => PendingActiveEventKind::Set(visible),
+                None => PendingActiveEventKind::Clear,
+            },
+        });
+        self.last_active_change = Some(Instant::now());
+    }
+}
+
+fn read_utf8_chunk(
+    path: &PathBuf,
+    start_offset: u64,
+    max_bytes: usize,
+) -> std::io::Result<(String, usize)> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start_offset))?;
+
+    let mut raw = vec![0u8; max_bytes];
+    let bytes_read = file.read(&mut raw)?;
+    raw.truncate(bytes_read);
+    if raw.is_empty() {
+        return Ok((String::new(), 0));
+    }
+
+    let mut valid_len = raw.len();
+    while valid_len > 0 && std::str::from_utf8(&raw[..valid_len]).is_err() {
+        valid_len -= 1;
+    }
+
+    if valid_len == 0 {
+        return Ok((String::new(), 0));
+    }
+
+    let content = String::from_utf8(raw[..valid_len].to_vec())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+
+    Ok((content, valid_len))
 }
 
 /// TaskNexus Agent - 客户端代理
@@ -238,6 +496,22 @@ impl Agent {
             error!("Failed to send task started: {}", e);
         }
 
+        let log_sync_state = match TaskLogSyncState::new(&self.config.workspaces_path, task_id) {
+            Ok(state) => Arc::new(Mutex::new(state)),
+            Err(e) => {
+                error!(
+                    "Failed to initialize task log sync state for {}: {}",
+                    task_id, e
+                );
+                let _ = self
+                    .client
+                    .send_task_failed(task_id, format!("Failed to initialize task logs: {}", e))
+                    .await;
+                self.running_tasks.write().await.remove(&task_id);
+                return;
+            }
+        };
+
         // 启动任务心跳发送器
         let heartbeat_client = self.client.clone();
         let mut heartbeat_cancel_rx = cancel_rx.clone();
@@ -257,45 +531,25 @@ impl Agent {
             }
         });
 
-        // 创建日志缓冲区，按批次发送（每 500ms）
-        let log_buffer: Arc<tokio::sync::Mutex<Vec<BufferedLogEvent>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
-        // 输出回调 — 只缓冲日志行，不立即发送
-        let buffer_for_callback = log_buffer.clone();
+        let state_for_callback = log_sync_state.clone();
         let output_callback = move |line: String, is_stderr: bool| {
-            let buffer = buffer_for_callback.clone();
-            let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+            let state = state_for_callback.clone();
             async move {
-                buffer
-                    .lock()
-                    .await
-                    .push(BufferedLogEvent {
-                        output: format!("[{}] {}", timestamp, line),
-                        is_stderr,
-                    });
+                let mut guard = state.lock().await;
+                if let Err(e) = guard.ingest_chunk(&line, is_stderr) {
+                    error!("Failed to buffer task log chunk: {}", e);
+                }
             }
         };
 
-        // 日志批量发送任务 — 每 500ms flush 一次缓冲区
         let flush_client = self.client.clone();
-        let flush_buffer = log_buffer.clone();
+        let flush_state = log_sync_state.clone();
         let log_flush_task = tokio::spawn(async move {
-            let mut tick = interval(Duration::from_millis(500));
+            let mut tick = interval(Duration::from_millis(LOG_ACTIVE_DEBOUNCE_MS));
             loop {
                 tick.tick().await;
-                let mut buf = flush_buffer.lock().await;
-                if !buf.is_empty() {
-                    let events = std::mem::take(&mut *buf);
-                    drop(buf); // 释放锁再 await
-                    for event in events {
-                        for chunk in split_log_chunks(&event.output, MAX_LOG_CHUNK_BYTES) {
-                            let _ = flush_client
-                                .send_task_progress(task_id, chunk, event.is_stderr)
-                                .await;
-                        }
-                    }
-                }
+                let mut guard = flush_state.lock().await;
+                let _ = guard.sync_with_server(&flush_client, false, false).await;
             }
         });
 
@@ -328,20 +582,13 @@ impl Agent {
         log_flush_task.abort();
         heartbeat_task.abort();
 
-        // Flush 剩余缓冲的日志
         {
-            let mut buf = log_buffer.lock().await;
-            if !buf.is_empty() {
-                let events = std::mem::take(&mut *buf);
-                drop(buf);
-                for event in events {
-                    for chunk in split_log_chunks(&event.output, MAX_LOG_CHUNK_BYTES) {
-                        let _ = self
-                            .client
-                            .send_task_progress(task_id, chunk, event.is_stderr)
-                            .await;
-                    }
-                }
+            let mut guard = log_sync_state.lock().await;
+            if let Err(e) = guard.finalize_pending() {
+                error!("Failed to finalize task log state for {}: {}", task_id, e);
+            }
+            if let Err(e) = guard.sync_with_server(&self.client, true, true).await {
+                warn!("Failed to flush task logs for {}: {}", task_id, e);
             }
         }
 
