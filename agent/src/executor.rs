@@ -17,6 +17,57 @@ use tracing::{debug, error, info, warn};
 const RESULT_BEGIN_MARKER: &str = "##TASKNEXUS_RESULT_BEGIN##";
 const RESULT_END_MARKER: &str = "##TASKNEXUS_RESULT_END##";
 
+fn default_shell_path() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "/bin/zsh"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "/bin/bash"
+    }
+    #[cfg(windows)]
+    {
+        "cmd"
+    }
+}
+
+fn shell_name_from_path(shell_path: &str) -> &str {
+    let trimmed = shell_path.trim();
+    trimmed
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed)
+        .rsplit('\\')
+        .next()
+        .unwrap_or(trimmed)
+}
+
+fn resolve_shell_path(environment: Option<&HashMap<String, String>>) -> String {
+    environment
+        .and_then(|env| env.get("SHELL"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_shell_path())
+        .to_string()
+}
+
+fn resolve_shell_name(environment: Option<&HashMap<String, String>>) -> String {
+    let shell_path = resolve_shell_path(environment);
+    shell_name_from_path(&shell_path).to_string()
+}
+
+fn is_cmd_shell(shell_name: &str) -> bool {
+    matches!(shell_name, "cmd" | "cmd.exe")
+}
+
+fn is_powershell_shell(shell_name: &str) -> bool {
+    matches!(
+        shell_name,
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    )
+}
+
 /// 杀死进程及其所有子进程
 async fn kill_process_tree(child: &mut Child) {
     let pid = match child.id() {
@@ -131,39 +182,13 @@ impl CommandExecutor {
             info!("Working directory: {:?}", dir);
         }
 
-        // 从环境变量读取 SHELL，未设置则按平台使用默认值
-        let shell_from_env = environment.and_then(|env| env.get("SHELL").cloned());
-
-        let default_shell = {
-            #[cfg(target_os = "macos")]
-            {
-                "/bin/zsh"
-            }
-            #[cfg(target_os = "linux")]
-            {
-                "/bin/bash"
-            }
-            #[cfg(windows)]
-            {
-                "cmd"
-            }
-        };
-
-        let shell_path = shell_from_env.as_deref().unwrap_or(default_shell);
-
-        // 提取 shell 基本名称用于参数映射
-        let shell_name = shell_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(shell_path)
-            .rsplit('\\')
-            .next()
-            .unwrap_or(shell_path);
+        let shell_path = resolve_shell_path(environment);
+        let shell_name = shell_name_from_path(&shell_path).to_string();
 
         info!("Using shell: {} ({})", shell_path, shell_name);
 
         // 根据 shell 名称选择参数
-        let shell_args: Vec<&str> = match shell_name {
+        let shell_args: Vec<&str> = match shell_name.as_str() {
             "zsh" | "bash" => vec!["-l", "-c"],
             "sh" => vec!["-c"],
             "cmd" | "cmd.exe" => vec!["/C"],
@@ -171,12 +196,12 @@ impl CommandExecutor {
             _ => vec!["-c"],
         };
 
-        let mut cmd = Command::new(shell_path);
+        let mut cmd = Command::new(&shell_path);
 
         // Windows cmd.exe 默认使用 GBK 编码，切换代码页为 UTF-8 (65001)
         #[cfg(windows)]
         let actual_cmd = {
-            if shell_name == "cmd" || shell_name == "cmd.exe" {
+            if is_cmd_shell(&shell_name) {
                 format!("chcp 65001 >nul && {}", command)
             } else {
                 command.to_string()
@@ -225,7 +250,6 @@ impl CommandExecutor {
         // 在 Windows 上使用 CREATE_NO_WINDOW 标志
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
@@ -604,6 +628,21 @@ impl TaskRunner {
             };
         }
 
+        // 设置环境变量
+        let mut task_env = self.base_env.clone();
+        task_env.insert("TASKNEXUS_TASK_ID".to_string(), task_id.to_string());
+        task_env.insert(
+            "TASKNEXUS_WORKSPACE".to_string(),
+            workspace_name.to_string(),
+        );
+
+        // 合并任务自定义环境变量，允许覆盖默认代理配置
+        if let Some(env) = environment {
+            task_env.extend(env);
+        }
+
+        let shell_name = resolve_shell_name(Some(&task_env));
+
         let mut temp_code_path: Option<PathBuf> = None;
         let actual_command = if normalized_mode == "code" {
             let inline_code = match code {
@@ -662,32 +701,17 @@ impl TaskRunner {
                 }
             };
             temp_code_path = Some(temp_path.clone());
-            Self::build_inline_code_command(&language, &temp_path)
+            Self::build_inline_code_command(&language, &temp_path, &shell_name)
         } else {
             // 根据仓库名和脚本路径构建实际执行命令
-            // command 为相对于仓库根目录的脚本路径，如 "entries/project_setup.py"
-            // 拼接为 "{repo_name}/{command}"，再根据扩展名生成执行命令
             if let Some(ref repo_name) = repo_name {
                 let script_path = format!("{}/{}", repo_name, command);
-                Self::build_script_command(&script_path)
+                Self::build_script_command(&script_path, &shell_name)
             } else {
-                Self::build_script_command(command)
+                Self::build_script_command(command, &shell_name)
             }
         };
         info!("Resolved command: {}", actual_command);
-
-        // 设置环境变量
-        let mut task_env = self.base_env.clone();
-        task_env.insert("TASKNEXUS_TASK_ID".to_string(), task_id.to_string());
-        task_env.insert(
-            "TASKNEXUS_WORKSPACE".to_string(),
-            workspace_name.to_string(),
-        );
-
-        // 合并任务自定义环境变量，允许覆盖默认代理配置
-        if let Some(env) = environment {
-            task_env.extend(env);
-        }
 
         // 执行命令
         let result = self
@@ -755,23 +779,19 @@ impl TaskRunner {
         Ok(file_path)
     }
 
-    fn build_inline_code_command(language: &str, script_path: &Path) -> String {
-        let quoted_path = Self::quote_command_arg(script_path);
+    fn build_inline_code_command(language: &str, script_path: &Path, shell_name: &str) -> String {
         if language == "python" {
-            Self::build_python_command_with_quoted_path(&quoted_path)
+            Self::build_python_command(script_path.to_str().unwrap_or(""))
         } else {
-            format!("bash {}", quoted_path)
+            format!("bash {}", script_path.display())
         }
     }
 
     /// 根据脚本路径的扩展名生成执行命令
-    fn build_script_command(script_path: &str) -> String {
+    fn build_script_command(script_path: &str, shell_name: &str) -> String {
         let ext = script_path.rsplit('.').next().unwrap_or("");
         match ext {
-            "py" => {
-                let quoted_path = Self::quote_raw_arg(script_path);
-                Self::build_python_command_with_quoted_path(&quoted_path)
-            }
+            "py" => Self::build_python_command(script_path),
             "sh" => format!("bash {}", script_path),
             "js" => format!("node {}", script_path),
             "ts" => format!("npx ts-node {}", script_path),
@@ -780,34 +800,18 @@ impl TaskRunner {
         }
     }
 
-    fn build_python_command_with_quoted_path(quoted_path: &str) -> String {
+    fn build_python_command(script_path: &str) -> String {
         #[cfg(windows)]
         {
-            format!("python {}", quoted_path)
+            format!("python {}", script_path)
         }
         #[cfg(not(windows))]
         {
             format!(
                 "if command -v python3 >/dev/null 2>&1; then python3 {}; else python {}; fi",
-                quoted_path, quoted_path
+                script_path, script_path
             )
         }
-    }
-
-    fn quote_raw_arg(raw: &str) -> String {
-        #[cfg(windows)]
-        {
-            format!("\"{}\"", raw.replace('"', "\\\""))
-        }
-        #[cfg(not(windows))]
-        {
-            format!("'{}'", raw.replace('\'', "'\"'\"'"))
-        }
-    }
-
-    fn quote_command_arg(path: &Path) -> String {
-        let raw = path.to_string_lossy().to_string();
-        Self::quote_raw_arg(&raw)
     }
 
     /// Inject token into an HTTPS URL for authenticated git operations
