@@ -1,6 +1,6 @@
 [package]
 name = "tasknexus-agent"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "TaskNexus 客户端代理 - 连接到 TaskNexus 服务器执行远程任务"
 license = "MIT"
