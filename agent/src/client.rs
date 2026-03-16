@@ -6,7 +6,8 @@ use crate::config::{AgentConfig, SystemInfo};
 use crate::error::{AgentError, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Duration};
@@ -35,6 +36,10 @@ pub enum ServerMessage {
     },
     HeartbeatAck {
         server_time: String,
+    },
+    TaskLogAck {
+        task_id: i64,
+        next_offset: u64,
     },
     TaskDispatch {
         task_id: i64,
@@ -91,11 +96,6 @@ pub enum ClientMessage {
     TaskStarted {
         task_id: i64,
     },
-    TaskProgress {
-        task_id: i64,
-        output: String,
-        is_stderr: bool,
-    },
     TaskLogAppend {
         task_id: i64,
         start_offset: u64,
@@ -151,6 +151,67 @@ pub struct AgentUpdateData {
     pub task_id: i64,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedLogMessage {
+    task_id: i64,
+    message: ClientMessage,
+}
+
+#[derive(Default)]
+struct FairLogQueue {
+    queues: HashMap<i64, VecDeque<ClientMessage>>,
+    ready_tasks: VecDeque<i64>,
+}
+
+impl FairLogQueue {
+    fn push(&mut self, task_id: i64, message: ClientMessage) {
+        let queue = self.queues.entry(task_id).or_default();
+        let was_empty = queue.is_empty();
+        queue.push_back(message);
+        if was_empty {
+            self.ready_tasks.push_back(task_id);
+        }
+    }
+
+    fn pop(&mut self) -> Option<ClientMessage> {
+        while let Some(task_id) = self.ready_tasks.pop_front() {
+            let mut remove_task = false;
+            let maybe_message = if let Some(queue) = self.queues.get_mut(&task_id) {
+                let message = queue.pop_front();
+                if queue.is_empty() {
+                    remove_task = true;
+                } else {
+                    self.ready_tasks.push_back(task_id);
+                }
+                message
+            } else {
+                None
+            };
+
+            if remove_task {
+                self.queues.remove(&task_id);
+            }
+
+            if maybe_message.is_some() {
+                return maybe_message;
+            }
+        }
+
+        None
+    }
+}
+
+fn log_task_id(message: &ClientMessage) -> Option<i64> {
+    match message {
+        ClientMessage::TaskLogAppend { task_id, .. }
+        | ClientMessage::TaskLogActive { task_id, .. }
+        | ClientMessage::TaskLogActiveClear { task_id, .. }
+        | ClientMessage::TaskCompleted { task_id, .. }
+        | ClientMessage::TaskFailed { task_id, .. } => Some(*task_id),
+        _ => None,
+    }
+}
+
 /// WebSocket 客户端
 #[derive(Clone)]
 pub struct AgentClient {
@@ -159,7 +220,9 @@ pub struct AgentClient {
     running: Arc<RwLock<bool>>,
     reconnect_attempts: Arc<RwLock<u32>>,
     control_sender: Arc<RwLock<Option<mpsc::Sender<ClientMessage>>>>,
-    log_sender: Arc<RwLock<Option<mpsc::Sender<ClientMessage>>>>,
+    log_sender: Arc<RwLock<Option<mpsc::Sender<QueuedLogMessage>>>>,
+    log_ack_offsets: Arc<RwLock<HashMap<i64, u64>>>,
+    connection_generation: Arc<AtomicU64>,
 }
 
 impl AgentClient {
@@ -171,6 +234,8 @@ impl AgentClient {
             reconnect_attempts: Arc::new(RwLock::new(0)),
             control_sender: Arc::new(RwLock::new(None)),
             log_sender: Arc::new(RwLock::new(None)),
+            log_ack_offsets: Arc::new(RwLock::new(HashMap::new())),
+            connection_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -202,11 +267,16 @@ impl AgentClient {
     }
 
     async fn send_log_message(&self, message: ClientMessage) -> Result<()> {
+        let task_id = log_task_id(&message).ok_or_else(|| {
+            AgentError::Connection("Cannot send log message without task context".to_string())
+        })?;
         let sender = self.log_sender.read().await;
         if let Some(tx) = sender.as_ref() {
-            tx.send(message).await.map_err(|e| {
-                AgentError::Connection(format!("Failed to send log message: {}", e))
-            })?;
+            tx.send(QueuedLogMessage { task_id, message })
+                .await
+                .map_err(|e| {
+                    AgentError::Connection(format!("Failed to send log message: {}", e))
+                })?;
             return Ok(());
         }
         Err(AgentError::Connection(
@@ -214,13 +284,41 @@ impl AgentClient {
         ))
     }
 
+    pub async fn is_connected(&self) -> bool {
+        *self.connected.read().await
+    }
+
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation.load(Ordering::SeqCst)
+    }
+
+    async fn record_task_log_ack(&self, task_id: i64, next_offset: u64) {
+        let mut ack_offsets = self.log_ack_offsets.write().await;
+        ack_offsets
+            .entry(task_id)
+            .and_modify(|current| *current = (*current).max(next_offset))
+            .or_insert(next_offset);
+    }
+
+    pub async fn get_task_log_ack(&self, task_id: i64) -> u64 {
+        self.log_ack_offsets
+            .read()
+            .await
+            .get(&task_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub async fn clear_task_log_ack(&self, task_id: i64) {
+        self.log_ack_offsets.write().await.remove(&task_id);
+    }
+
     /// 发送消息到服务器
     pub async fn send_message(&self, message: ClientMessage) -> Result<()> {
         // Keep task output and terminal events in the same queue so their ordering is stable.
         if matches!(
             message,
-            ClientMessage::TaskProgress { .. }
-                | ClientMessage::TaskLogAppend { .. }
+            ClientMessage::TaskLogAppend { .. }
                 | ClientMessage::TaskLogActive { .. }
                 | ClientMessage::TaskLogActiveClear { .. }
                 | ClientMessage::TaskCompleted { .. }
@@ -243,21 +341,6 @@ impl AgentClient {
     pub async fn send_task_started(&self, task_id: i64) -> Result<()> {
         self.send_message(ClientMessage::TaskStarted { task_id })
             .await
-    }
-
-    /// 发送任务进度更新
-    pub async fn send_task_progress(
-        &self,
-        task_id: i64,
-        output: String,
-        is_stderr: bool,
-    ) -> Result<()> {
-        self.send_log_message(ClientMessage::TaskProgress {
-            task_id,
-            output,
-            is_stderr,
-        })
-        .await
     }
 
     pub async fn send_task_log_append(
@@ -439,13 +522,18 @@ impl AgentClient {
         let (ws_stream, _) = connect_async(url.as_str()).await?;
         info!("Connected to server successfully");
         *self.connected.write().await = true;
+        let connection_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        debug!(
+            "Established websocket connection generation {}",
+            connection_generation
+        );
         on_connected();
 
         let (write, mut read) = ws_stream.split();
 
         // 控制/日志分队列，控制消息优先发送
         let (control_tx, mut control_rx) = mpsc::channel::<ClientMessage>(100);
-        let (log_tx, mut log_rx) = mpsc::channel::<ClientMessage>(100);
+        let (log_tx, mut log_rx) = mpsc::channel::<QueuedLogMessage>(1024);
         *self.control_sender.write().await = Some(control_tx.clone());
         *self.log_sender.write().await = Some(log_tx);
 
@@ -455,26 +543,67 @@ impl AgentClient {
         let send_task = tokio::spawn(async move {
             let mut control_closed = false;
             let mut log_closed = false;
+            let mut fair_log_queue = FairLogQueue::default();
 
             loop {
+                loop {
+                    match control_rx.try_recv() {
+                        Ok(msg) => match serde_json::to_string(&msg) {
+                            Ok(json) => {
+                                let mut w = write_clone.lock().await;
+                                if let Err(e) = w.send(Message::Text(json)).await {
+                                    error!("Failed to send control message: {}", e);
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize control message: {}", e);
+                            }
+                        },
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            control_closed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(msg) = fair_log_queue.pop() {
+                    match serde_json::to_string(&msg) {
+                        Ok(json) => {
+                            let mut w = write_clone.lock().await;
+                            if let Err(e) = w.send(Message::Text(json)).await {
+                                error!("Failed to send log message: {}", e);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize log message: {}", e);
+                        }
+                    }
+                    continue;
+                }
+
+                if control_closed && log_closed {
+                    break;
+                }
+
                 tokio::select! {
                     biased;
                     msg = control_rx.recv(), if !control_closed => {
                         match msg {
-                            Some(msg) => {
-                                match serde_json::to_string(&msg) {
-                                    Ok(json) => {
-                                        let mut w = write_clone.lock().await;
-                                        if let Err(e) = w.send(Message::Text(json)).await {
-                                            error!("Failed to send control message: {}", e);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to serialize control message: {}", e);
+                            Some(msg) => match serde_json::to_string(&msg) {
+                                Ok(json) => {
+                                    let mut w = write_clone.lock().await;
+                                    if let Err(e) = w.send(Message::Text(json)).await {
+                                        error!("Failed to send control message: {}", e);
+                                        break;
                                     }
                                 }
-                            }
+                                Err(e) => {
+                                    error!("Failed to serialize control message: {}", e);
+                                }
+                            },
                             None => {
                                 control_closed = true;
                             }
@@ -482,29 +611,12 @@ impl AgentClient {
                     }
                     msg = log_rx.recv(), if !log_closed => {
                         match msg {
-                            Some(msg) => {
-                                match serde_json::to_string(&msg) {
-                                    Ok(json) => {
-                                        let mut w = write_clone.lock().await;
-                                        if let Err(e) = w.send(Message::Text(json)).await {
-                                            error!("Failed to send log message: {}", e);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to serialize log message: {}", e);
-                                    }
-                                }
-                            }
+                            Some(msg) => fair_log_queue.push(msg.task_id, msg.message),
                             None => {
                                 log_closed = true;
                             }
                         }
                     }
-                }
-
-                if control_closed && log_closed {
-                    break;
                 }
             }
         });
@@ -592,6 +704,12 @@ impl AgentClient {
             ServerMessage::HeartbeatAck { server_time } => {
                 debug!("Heartbeat acknowledged at {}", server_time);
             }
+            ServerMessage::TaskLogAck {
+                task_id,
+                next_offset,
+            } => {
+                self.record_task_log_ack(task_id, next_offset).await;
+            }
             ServerMessage::TaskDispatch {
                 task_id,
                 workspace_name,
@@ -648,5 +766,71 @@ impl AgentClient {
     pub async fn stop(&self) {
         info!("Stopping agent client...");
         *self.running.write().await = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientMessage, FairLogQueue};
+    use std::collections::HashMap;
+
+    fn append(task_id: i64, start_offset: u64) -> ClientMessage {
+        ClientMessage::TaskLogAppend {
+            task_id,
+            start_offset,
+            content: format!("chunk-{}", start_offset),
+        }
+    }
+
+    #[test]
+    fn fair_log_queue_round_robins_between_tasks() {
+        let mut queue = FairLogQueue::default();
+        queue.push(1, append(1, 0));
+        queue.push(1, append(1, 10));
+        queue.push(2, append(2, 0));
+        queue.push(3, append(3, 0));
+        queue.push(2, append(2, 10));
+
+        let mut order = Vec::new();
+        while let Some(message) = queue.pop() {
+            match message {
+                ClientMessage::TaskLogAppend {
+                    task_id,
+                    start_offset,
+                    ..
+                } => order.push((task_id, start_offset)),
+                _ => unreachable!("unexpected message type"),
+            }
+        }
+
+        assert_eq!(order, vec![(1, 0), (2, 0), (3, 0), (1, 10), (2, 10)]);
+    }
+
+    #[test]
+    fn fair_log_queue_preserves_order_within_each_task() {
+        let mut queue = FairLogQueue::default();
+        let mut expected = HashMap::new();
+        expected.insert(7, vec![0, 5, 10]);
+        expected.insert(8, vec![0, 9]);
+
+        queue.push(7, append(7, 0));
+        queue.push(8, append(8, 0));
+        queue.push(7, append(7, 5));
+        queue.push(7, append(7, 10));
+        queue.push(8, append(8, 9));
+
+        let mut actual: HashMap<i64, Vec<u64>> = HashMap::new();
+        while let Some(message) = queue.pop() {
+            match message {
+                ClientMessage::TaskLogAppend {
+                    task_id,
+                    start_offset,
+                    ..
+                } => actual.entry(task_id).or_default().push(start_offset),
+                _ => unreachable!("unexpected message type"),
+            }
+        }
+
+        assert_eq!(actual, expected);
     }
 }

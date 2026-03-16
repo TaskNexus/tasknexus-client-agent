@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 /// Magic markers for structured result extraction from stdout
 const RESULT_BEGIN_MARKER: &str = "##TASKNEXUS_RESULT_BEGIN##";
 const RESULT_END_MARKER: &str = "##TASKNEXUS_RESULT_END##";
+const MAX_CAPTURED_OUTPUT_CHARS: usize = 16 * 1024;
 
 fn default_shell_path() -> &'static str {
     #[cfg(target_os = "macos")]
@@ -52,11 +53,7 @@ fn resolve_shell_path(environment: Option<&HashMap<String, String>>) -> String {
         .to_string()
 }
 
-fn resolve_shell_name(environment: Option<&HashMap<String, String>>) -> String {
-    let shell_path = resolve_shell_path(environment);
-    shell_name_from_path(&shell_path).to_string()
-}
-
+#[cfg(windows)]
 fn is_cmd_shell(shell_name: &str) -> bool {
     matches!(shell_name, "cmd" | "cmd.exe")
 }
@@ -106,42 +103,171 @@ pub struct ExecutionResult {
     pub result: HashMap<String, serde_json::Value>,
 }
 
-/// Extract structured result JSON from stdout between magic markers.
-///
-/// Returns ``(cleaned_stdout, result_map)``.
-/// If no markers are found the stdout is returned unchanged and the map is empty.
-fn extract_result(raw_stdout: &str) -> (String, HashMap<String, serde_json::Value>) {
-    let begin = raw_stdout.find(RESULT_BEGIN_MARKER);
-    let end = raw_stdout.find(RESULT_END_MARKER);
+#[derive(Default)]
+struct OutputTail {
+    text: String,
+    truncated: bool,
+}
 
-    if let (Some(b), Some(e)) = (begin, end) {
-        if b < e {
-            let json_start = b + RESULT_BEGIN_MARKER.len();
-            let json_str = raw_stdout[json_start..e].trim();
+impl OutputTail {
+    fn append(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
 
-            let result: HashMap<String, serde_json::Value> = match serde_json::from_str(json_str) {
-                Ok(map) => map,
-                Err(err) => {
-                    warn!("Failed to parse result JSON: {}", err);
-                    HashMap::new()
-                }
-            };
+        self.text.push_str(chunk);
+        let total_chars = self.text.chars().count();
+        if total_chars <= MAX_CAPTURED_OUTPUT_CHARS {
+            return;
+        }
 
-            // Strip the marker block (including surrounding newlines) from stdout
-            let before = raw_stdout[..b].trim_end_matches('\n');
-            let after_end = e + RESULT_END_MARKER.len();
-            let after = raw_stdout[after_end..].trim_start_matches('\n');
-            let cleaned = if after.is_empty() {
-                before.to_string()
-            } else {
-                format!("{}\n{}", before, after)
-            };
+        let overflow = total_chars - MAX_CAPTURED_OUTPUT_CHARS;
+        self.text = self.text.chars().skip(overflow).collect();
+        self.truncated = true;
+    }
 
-            return (cleaned, result);
+    fn finish(self) -> String {
+        if !self.truncated {
+            return self.text;
+        }
+
+        format!(
+            "[output truncated, showing last {} chars]\n{}",
+            MAX_CAPTURED_OUTPUT_CHARS, self.text
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdoutCaptureMode {
+    Visible,
+    StructuredResult,
+}
+
+struct StdoutCapture {
+    visible_output: OutputTail,
+    hidden_buffer: String,
+    mode: StdoutCaptureMode,
+    result: HashMap<String, serde_json::Value>,
+    last_visible_char: Option<char>,
+    suppress_next_leading_newline: bool,
+}
+
+impl StdoutCapture {
+    fn new() -> Self {
+        Self {
+            visible_output: OutputTail::default(),
+            hidden_buffer: String::new(),
+            mode: StdoutCaptureMode::Visible,
+            result: HashMap::new(),
+            last_visible_char: None,
+            suppress_next_leading_newline: false,
         }
     }
 
-    (raw_stdout.to_string(), HashMap::new())
+    fn process_chunk(&mut self, chunk: &str) -> String {
+        let mut remaining = self.maybe_trim_leading_newline(chunk);
+        let mut emitted = String::new();
+
+        while !remaining.is_empty() {
+            match self.mode {
+                StdoutCaptureMode::Visible => {
+                    if let Some(idx) = remaining.find(RESULT_BEGIN_MARKER) {
+                        let before = &remaining[..idx];
+                        self.push_visible(&mut emitted, before);
+                        self.mode = StdoutCaptureMode::StructuredResult;
+                        self.hidden_buffer.clear();
+                        self.hidden_buffer.push_str(RESULT_BEGIN_MARKER);
+                        remaining = &remaining[idx + RESULT_BEGIN_MARKER.len()..];
+                    } else {
+                        self.push_visible(&mut emitted, remaining);
+                        break;
+                    }
+                }
+                StdoutCaptureMode::StructuredResult => {
+                    if let Some(idx) = remaining.find(RESULT_END_MARKER) {
+                        self.hidden_buffer.push_str(&remaining[..idx]);
+                        self.capture_result_from_hidden_buffer();
+                        self.hidden_buffer.clear();
+                        self.mode = StdoutCaptureMode::Visible;
+                        self.suppress_next_leading_newline =
+                            matches!(self.last_visible_char, Some('\n' | '\r'));
+                        remaining = self.maybe_trim_leading_newline(
+                            &remaining[idx + RESULT_END_MARKER.len()..],
+                        );
+                    } else {
+                        self.hidden_buffer.push_str(remaining);
+                        break;
+                    }
+                }
+            }
+        }
+
+        emitted
+    }
+
+    fn finish(mut self) -> (String, HashMap<String, serde_json::Value>) {
+        if self.mode == StdoutCaptureMode::StructuredResult && !self.hidden_buffer.is_empty() {
+            let hidden = self.hidden_buffer.clone();
+            self.push_visible(&mut String::new(), &hidden);
+            self.hidden_buffer.clear();
+            self.mode = StdoutCaptureMode::Visible;
+        }
+
+        (self.visible_output.finish(), self.result)
+    }
+
+    fn push_visible(&mut self, emitted: &mut String, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        emitted.push_str(chunk);
+        self.visible_output.append(chunk);
+        self.last_visible_char = chunk.chars().last();
+    }
+
+    fn capture_result_from_hidden_buffer(&mut self) {
+        if !self.result.is_empty() {
+            return;
+        }
+
+        let json_str = self
+            .hidden_buffer
+            .strip_prefix(RESULT_BEGIN_MARKER)
+            .unwrap_or(self.hidden_buffer.as_str())
+            .trim();
+        self.result = match serde_json::from_str(json_str) {
+            Ok(map) => map,
+            Err(err) => {
+                warn!("Failed to parse result JSON: {}", err);
+                HashMap::new()
+            }
+        };
+    }
+
+    fn maybe_trim_leading_newline<'a>(&mut self, text: &'a str) -> &'a str {
+        if !self.suppress_next_leading_newline {
+            return text;
+        }
+
+        if let Some(rest) = text.strip_prefix("\r\n") {
+            self.suppress_next_leading_newline = false;
+            return rest;
+        }
+        if let Some(rest) = text.strip_prefix('\n') {
+            self.suppress_next_leading_newline = false;
+            return rest;
+        }
+        if let Some(rest) = text.strip_prefix('\r') {
+            self.suppress_next_leading_newline = false;
+            return rest;
+        }
+        if !text.is_empty() {
+            self.suppress_next_leading_newline = false;
+        }
+        text
+    }
 }
 
 fn split_stream_chunks(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<String> {
@@ -309,7 +435,7 @@ impl CommandExecutor {
 
         // 读取 stdout
         let stdout_handle = tokio::spawn(async move {
-            let mut chunks = Vec::new();
+            let mut stdout_capture = StdoutCapture::new();
             let mut read_buffer = [0u8; 4096];
             let mut pending = Vec::new();
 
@@ -326,22 +452,26 @@ impl CommandExecutor {
                 }
 
                 for chunk in split_stream_chunks(&mut pending, &read_buffer[..n]) {
-                    let _ = tx_stdout.send((chunk.clone(), false)).await;
-                    chunks.push(chunk);
+                    let visible_chunk = stdout_capture.process_chunk(&chunk);
+                    if !visible_chunk.is_empty() {
+                        let _ = tx_stdout.send((visible_chunk, false)).await;
+                    }
                 }
             }
 
             if let Some(tail) = flush_stream_buffer(&mut pending) {
-                let _ = tx_stdout.send((tail.clone(), false)).await;
-                chunks.push(tail);
+                let visible_tail = stdout_capture.process_chunk(&tail);
+                if !visible_tail.is_empty() {
+                    let _ = tx_stdout.send((visible_tail, false)).await;
+                }
             }
 
-            chunks
+            stdout_capture.finish()
         });
 
         // 读取 stderr
         let stderr_handle = tokio::spawn(async move {
-            let mut chunks = Vec::new();
+            let mut stderr_output = OutputTail::default();
             let mut read_buffer = [0u8; 4096];
             let mut pending = Vec::new();
 
@@ -358,17 +488,17 @@ impl CommandExecutor {
                 }
 
                 for chunk in split_stream_chunks(&mut pending, &read_buffer[..n]) {
+                    stderr_output.append(&chunk);
                     let _ = tx_stderr.send((chunk.clone(), true)).await;
-                    chunks.push(chunk);
                 }
             }
 
             if let Some(tail) = flush_stream_buffer(&mut pending) {
+                stderr_output.append(&tail);
                 let _ = tx_stderr.send((tail.clone(), true)).await;
-                chunks.push(tail);
             }
 
-            chunks
+            stderr_output.finish()
         });
 
         // 处理输出回调
@@ -387,12 +517,14 @@ impl CommandExecutor {
         // 注意：callback_handle 必须在 stdout/stderr handle 之后等待，
         // 确保所有日志发送回调完成后才返回，避免任务完成了但日志还没发完
         let timed_future = timeout(Duration::from_secs(timeout_secs), async {
-            let stdout_lines = stdout_handle.await.unwrap_or_default();
-            let stderr_lines = stderr_handle.await.unwrap_or_default();
+            let (stdout, result) = stdout_handle
+                .await
+                .unwrap_or_else(|_| (String::new(), HashMap::new()));
+            let stderr = stderr_handle.await.unwrap_or_default();
             // 等待所有日志发送完毕（senders 已 drop，rx 会自然结束）
             let _ = callback_handle.await;
             let status = child.wait().await;
-            (stdout_lines, stderr_lines, status)
+            (stdout, stderr, result, status)
         });
 
         // If we have a cancel receiver, `select!` between timeout and cancellation
@@ -400,16 +532,14 @@ impl CommandExecutor {
             tokio::select! {
                 result = timed_future => {
                     match result {
-                        Ok((stdout_parts, stderr_parts, status)) => {
+                        Ok((stdout, stderr, result, status)) => {
                             let exit_code = status
                                 .map(|s| s.code().unwrap_or(-1))
                                 .unwrap_or(-1);
-                            let raw_stdout = stdout_parts.concat();
-                            let (stdout, result) = extract_result(&raw_stdout);
                             ExecutionResult {
                                 exit_code,
                                 stdout,
-                                stderr: stderr_parts.concat(),
+                                stderr,
                                 timed_out: false,
                                 cancelled: false,
                                 result,
@@ -446,14 +576,12 @@ impl CommandExecutor {
             // No cancellation - original behavior
             let result = timed_future.await;
             match result {
-                Ok((stdout_parts, stderr_parts, status)) => {
+                Ok((stdout, stderr, result, status)) => {
                     let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                    let raw_stdout = stdout_parts.concat();
-                    let (stdout, result) = extract_result(&raw_stdout);
                     ExecutionResult {
                         exit_code,
                         stdout,
-                        stderr: stderr_parts.concat(),
+                        stderr,
                         timed_out: false,
                         cancelled: false,
                         result,
@@ -695,8 +823,6 @@ impl TaskRunner {
             task_env.extend(env);
         }
 
-        let shell_name = resolve_shell_name(Some(&task_env));
-
         let mut temp_code_path: Option<PathBuf> = None;
         let actual_command = if normalized_mode == "code" {
             let inline_code = match code {
@@ -755,14 +881,14 @@ impl TaskRunner {
                 }
             };
             temp_code_path = Some(temp_path.clone());
-            Self::build_inline_code_command(&language, &temp_path, &shell_name)
+            Self::build_inline_code_command(&language, &temp_path)
         } else {
             // 根据仓库名和脚本路径构建实际执行命令
             if let Some(ref repo_name) = repo_name {
                 let script_path = format!("{}/{}", repo_name, command);
-                Self::build_script_command(&script_path, &shell_name)
+                Self::build_script_command(&script_path)
             } else {
-                Self::build_script_command(command, &shell_name)
+                Self::build_script_command(command)
             }
         };
         info!("Resolved command: {}", actual_command);
@@ -833,7 +959,7 @@ impl TaskRunner {
         Ok(file_path)
     }
 
-    fn build_inline_code_command(language: &str, script_path: &Path, shell_name: &str) -> String {
+    fn build_inline_code_command(language: &str, script_path: &Path) -> String {
         if language == "python" {
             Self::build_python_command(script_path.to_str().unwrap_or(""))
         } else {
@@ -842,7 +968,7 @@ impl TaskRunner {
     }
 
     /// 根据脚本路径的扩展名生成执行命令
-    fn build_script_command(script_path: &str, shell_name: &str) -> String {
+    fn build_script_command(script_path: &str) -> String {
         let ext = script_path.rsplit('.').next().unwrap_or("");
         match ext {
             "py" => Self::build_python_command(script_path),
@@ -961,5 +1087,50 @@ impl TaskRunner {
                 None,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StdoutCapture, RESULT_BEGIN_MARKER, RESULT_END_MARKER};
+
+    #[test]
+    fn stdout_capture_extracts_structured_result_and_hides_markers() {
+        let mut capture = StdoutCapture::new();
+        let first = capture.process_chunk("hello\n");
+        let second = capture.process_chunk(RESULT_BEGIN_MARKER);
+        let third = capture.process_chunk("{\"artifact\":\"demo.apk\"}");
+        let fourth = capture.process_chunk(RESULT_END_MARKER);
+        let fifth = capture.process_chunk("\nworld\n");
+        let (stdout, result) = capture.finish();
+
+        assert_eq!(first, "hello\n");
+        assert_eq!(second, "");
+        assert_eq!(third, "");
+        assert_eq!(fourth, "");
+        assert_eq!(fifth, "world\n");
+        assert_eq!(stdout, "hello\nworld\n");
+        assert_eq!(
+            result.get("artifact").and_then(|value| value.as_str()),
+            Some("demo.apk")
+        );
+    }
+
+    #[test]
+    fn stdout_capture_restores_incomplete_marker_block_to_output() {
+        let mut capture = StdoutCapture::new();
+        let emitted = capture.process_chunk("prefix\n");
+        let hidden_start = capture.process_chunk(RESULT_BEGIN_MARKER);
+        let hidden_body = capture.process_chunk("{\"artifact\":\"demo.apk\"");
+        let (stdout, result) = capture.finish();
+
+        assert_eq!(emitted, "prefix\n");
+        assert_eq!(hidden_start, "");
+        assert_eq!(hidden_body, "");
+        assert_eq!(
+            stdout,
+            format!("prefix\n{}{{\"artifact\":\"demo.apk\"", RESULT_BEGIN_MARKER)
+        );
+        assert!(result.is_empty());
     }
 }

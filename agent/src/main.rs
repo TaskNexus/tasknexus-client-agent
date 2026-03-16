@@ -5,8 +5,8 @@
 use chrono::Local;
 use clap::Parser;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -23,8 +23,12 @@ use tasknexus_agent::{
 };
 
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
-const LOG_APPEND_INTERVAL_MS: u64 = 500;
+const LOG_APPEND_INTERVAL_MS: u64 = 200;
+const LOG_SYNC_INTERVAL_MS: u64 = 25;
 const LOG_ACTIVE_DEBOUNCE_MS: u64 = 125;
+const LOG_APPEND_ACK_TIMEOUT_MS: u64 = 1000;
+const LOG_FINAL_SYNC_TIMEOUT_MS: u64 = 5000;
+const MAX_STORED_OUTPUT_CHARS: usize = 16 * 1024;
 const TASK_LOG_DIR_NAME: &str = ".tasknexus_task_logs";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,16 +49,25 @@ struct PendingActiveEvent {
     kind: PendingActiveEventKind,
 }
 
+struct InflightAppend {
+    start_offset: u64,
+    end_offset: u64,
+    sent_at: Instant,
+    connection_generation: u64,
+}
+
 struct TaskLogSyncState {
     task_id: i64,
     local_log_path: PathBuf,
+    writer: BufWriter<File>,
     committed_offset: u64,
-    synced_offset: u64,
+    acked_offset: u64,
     line_timestamp: Option<String>,
     line_buffer: String,
     line_is_stderr: bool,
     active_display: Option<VisibleLine>,
     pending_active_event: Option<PendingActiveEvent>,
+    inflight_append: Option<InflightAppend>,
     next_active_seq: u64,
     last_append_flush: Instant,
     last_active_change: Option<Instant>,
@@ -65,18 +78,20 @@ impl TaskLogSyncState {
         let log_dir = workspaces_path.join(TASK_LOG_DIR_NAME);
         fs::create_dir_all(&log_dir)?;
         let local_log_path = log_dir.join(format!("task_{}.log", task_id));
-        File::create(&local_log_path)?;
+        let file = File::create(&local_log_path)?;
 
         Ok(Self {
             task_id,
             local_log_path,
+            writer: BufWriter::new(file),
             committed_offset: 0,
-            synced_offset: 0,
+            acked_offset: 0,
             line_timestamp: None,
             line_buffer: String::new(),
             line_is_stderr: false,
             active_display: None,
             pending_active_event: None,
+            inflight_append: None,
             next_active_seq: 0,
             last_append_flush: Instant::now(),
             last_active_change: None,
@@ -143,41 +158,37 @@ impl TaskLogSyncState {
         force_append: bool,
         force_active: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let backlog = self.committed_offset.saturating_sub(self.synced_offset);
+        self.reconcile_ack(client).await;
+        self.retry_inflight_append_if_needed(client).await?;
+
+        let backlog = self.committed_offset.saturating_sub(self.acked_offset);
         let should_flush_append = backlog > 0
             && (force_append
                 || backlog >= MAX_LOG_CHUNK_BYTES as u64
                 || self.last_append_flush.elapsed()
                     >= Duration::from_millis(LOG_APPEND_INTERVAL_MS));
 
-        if should_flush_append {
-            loop {
-                if self.synced_offset >= self.committed_offset {
-                    break;
-                }
-
-                let (content, byte_len) = read_utf8_chunk(
-                    &self.local_log_path,
-                    self.synced_offset,
-                    MAX_LOG_CHUNK_BYTES,
-                )?;
-                if byte_len == 0 || content.is_empty() {
-                    break;
-                }
-
+        if self.inflight_append.is_none() && should_flush_append {
+            self.flush_local_log_writer()?;
+            let (content, byte_len) =
+                read_utf8_chunk(&self.local_log_path, self.acked_offset, MAX_LOG_CHUNK_BYTES)?;
+            if byte_len > 0 && !content.is_empty() {
+                let connection_generation = client.connection_generation();
                 client
-                    .send_task_log_append(self.task_id, self.synced_offset, content)
+                    .send_task_log_append(self.task_id, self.acked_offset, content)
                     .await?;
-                self.synced_offset += byte_len as u64;
+                self.inflight_append = Some(InflightAppend {
+                    start_offset: self.acked_offset,
+                    end_offset: self.acked_offset + byte_len as u64,
+                    sent_at: Instant::now(),
+                    connection_generation,
+                });
                 self.last_append_flush = Instant::now();
-
-                if !force_append && self.synced_offset < self.committed_offset {
-                    continue;
-                }
             }
         }
 
-        if self.synced_offset != self.committed_offset {
+        self.reconcile_ack(client).await;
+        if self.inflight_append.is_some() || self.acked_offset != self.committed_offset {
             return Ok(());
         }
 
@@ -202,7 +213,7 @@ impl TaskLogSyncState {
                     .send_task_log_active(
                         self.task_id,
                         pending.seq,
-                        self.synced_offset,
+                        self.acked_offset,
                         visible.text.clone(),
                         visible.is_stderr,
                     )
@@ -210,7 +221,7 @@ impl TaskLogSyncState {
             }
             PendingActiveEventKind::Clear => {
                 client
-                    .send_task_log_active_clear(self.task_id, pending.seq, self.synced_offset)
+                    .send_task_log_active_clear(self.task_id, pending.seq, self.acked_offset)
                     .await?;
             }
         }
@@ -253,9 +264,7 @@ impl TaskLogSyncState {
     fn commit_visible_line(&mut self, visible: VisibleLine) -> std::io::Result<()> {
         let record = format!("{}\n", visible.text);
         let bytes = record.as_bytes();
-        let mut file = OpenOptions::new().append(true).open(&self.local_log_path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
+        self.writer.write_all(bytes)?;
         self.committed_offset += bytes.len() as u64;
         self.update_active_display(None);
         Ok(())
@@ -283,6 +292,93 @@ impl TaskLogSyncState {
         });
         self.last_active_change = Some(Instant::now());
     }
+
+    fn flush_local_log_writer(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+
+    async fn reconcile_ack(&mut self, client: &AgentClient) {
+        let acked_offset = client.get_task_log_ack(self.task_id).await;
+        if acked_offset > self.acked_offset {
+            self.acked_offset = acked_offset;
+        }
+
+        if self
+            .inflight_append
+            .as_ref()
+            .map(|inflight| self.acked_offset >= inflight.end_offset)
+            .unwrap_or(false)
+        {
+            self.inflight_append = None;
+        }
+    }
+
+    async fn retry_inflight_append_if_needed(
+        &mut self,
+        client: &AgentClient,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some((start_offset, end_offset, previous_generation, previous_sent_at)) =
+            self.inflight_append.as_ref().map(|inflight| {
+                (
+                    inflight.start_offset,
+                    inflight.end_offset,
+                    inflight.connection_generation,
+                    inflight.sent_at,
+                )
+            })
+        else {
+            return Ok(());
+        };
+
+        if !client.is_connected().await {
+            return Ok(());
+        }
+
+        let connection_generation = client.connection_generation();
+        let should_resend = connection_generation != previous_generation
+            || previous_sent_at.elapsed() >= Duration::from_millis(LOG_APPEND_ACK_TIMEOUT_MS);
+        if !should_resend {
+            return Ok(());
+        }
+
+        self.flush_local_log_writer()?;
+        let max_bytes = end_offset.saturating_sub(start_offset) as usize;
+        let (content, byte_len) = read_utf8_chunk(&self.local_log_path, start_offset, max_bytes)?;
+        if byte_len == 0 || content.is_empty() {
+            return Ok(());
+        }
+
+        client
+            .send_task_log_append(self.task_id, start_offset, content)
+            .await?;
+        if let Some(inflight) = self.inflight_append.as_mut() {
+            inflight.sent_at = Instant::now();
+            inflight.connection_generation = connection_generation;
+        }
+        Ok(())
+    }
+
+    fn is_fully_synced(&self) -> bool {
+        self.acked_offset == self.committed_offset
+            && self.inflight_append.is_none()
+            && self.pending_active_event.is_none()
+    }
+}
+
+fn trim_output_for_storage(content: String) -> String {
+    let char_count = content.chars().count();
+    if char_count <= MAX_STORED_OUTPUT_CHARS {
+        return content;
+    }
+
+    let tail: String = content
+        .chars()
+        .skip(char_count - MAX_STORED_OUTPUT_CHARS)
+        .collect();
+    format!(
+        "[task output truncated, showing last {} chars]\n{}",
+        MAX_STORED_OUTPUT_CHARS, tail
+    )
 }
 
 fn read_utf8_chunk(
@@ -392,6 +488,59 @@ impl Agent {
         }
     }
 
+    async fn flush_task_logs_until_synced(
+        &self,
+        log_sync_state: &Arc<Mutex<TaskLogSyncState>>,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let is_synced = {
+                let mut guard = log_sync_state.lock().await;
+                if let Err(e) = guard.sync_with_server(&self.client, true, true).await {
+                    warn!("Failed to sync task log state for {}: {}", guard.task_id, e);
+                }
+                guard.is_fully_synced()
+            };
+
+            if is_synced {
+                return true;
+            }
+
+            if Instant::now() >= deadline {
+                return false;
+            }
+
+            tokio::time::sleep(Duration::from_millis(LOG_SYNC_INTERVAL_MS)).await;
+        }
+    }
+
+    async fn append_manual_task_log_line(
+        &self,
+        log_sync_state: &Arc<Mutex<TaskLogSyncState>>,
+        line: &str,
+        is_stderr: bool,
+    ) {
+        {
+            let mut guard = log_sync_state.lock().await;
+            if let Err(e) = guard.ingest_chunk(&format!("{}\n", line), is_stderr) {
+                error!("Failed to write manual task log line: {}", e);
+                return;
+            }
+        }
+
+        let synced = self
+            .flush_task_logs_until_synced(
+                log_sync_state,
+                Duration::from_millis(LOG_FINAL_SYNC_TIMEOUT_MS),
+            )
+            .await;
+        if !synced {
+            warn!("Timed out while syncing manual task log line for {}", line);
+        }
+    }
+
     async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting TaskNexus Agent: {}", self.config.name);
         info!("Server: {}", self.config.server);
@@ -496,6 +645,7 @@ impl Agent {
             error!("Failed to send task started: {}", e);
         }
 
+        self.client.clear_task_log_ack(task_id).await;
         let log_sync_state = match TaskLogSyncState::new(&self.config.workspaces_path, task_id) {
             Ok(state) => Arc::new(Mutex::new(state)),
             Err(e) => {
@@ -545,7 +695,7 @@ impl Agent {
         let flush_client = self.client.clone();
         let flush_state = log_sync_state.clone();
         let log_flush_task = tokio::spawn(async move {
-            let mut tick = interval(Duration::from_millis(LOG_ACTIVE_DEBOUNCE_MS));
+            let mut tick = interval(Duration::from_millis(LOG_SYNC_INTERVAL_MS));
             loop {
                 tick.tick().await;
                 let mut guard = flush_state.lock().await;
@@ -590,14 +740,16 @@ impl Agent {
             } else {
                 true
             };
-            let sync_ok = if let Err(e) = guard.sync_with_server(&self.client, true, true).await {
-                warn!("Failed to flush task logs for {}: {}", task_id, e);
-                false
-            } else {
-                true
-            };
-            (finalize_ok && sync_ok, guard.local_log_path.clone())
+            let local_log_path = guard.local_log_path.clone();
+            (finalize_ok, local_log_path)
         };
+        let fully_synced = self
+            .flush_task_logs_until_synced(
+                &log_sync_state,
+                Duration::from_millis(LOG_FINAL_SYNC_TIMEOUT_MS),
+            )
+            .await;
+        let local_log_flush_succeeded = local_log_flush_succeeded && fully_synced;
 
         // 发送结果
         if result.cancelled {
@@ -611,8 +763,8 @@ impl Agent {
                 .send_task_completed(
                     task_id,
                     result.exit_code,
-                    result.stdout,
-                    result.stderr,
+                    trim_output_for_storage(result.stdout),
+                    trim_output_for_storage(result.stderr),
                     result.result,
                 )
                 .await
@@ -638,8 +790,8 @@ impl Agent {
                     .send_task_completed(
                         task_id,
                         result.exit_code,
-                        result.stdout,
-                        result.stderr,
+                        trim_output_for_storage(result.stdout),
+                        trim_output_for_storage(result.stderr),
                         result.result,
                     )
                     .await
@@ -673,6 +825,7 @@ impl Agent {
         }
 
         // 移除运行中的任务
+        self.client.clear_task_log_ack(task_id).await;
         self.running_tasks.write().await.remove(&task_id);
     }
 
@@ -732,34 +885,60 @@ impl Agent {
             );
         }
 
-        let _ = self
-            .client
-            .send_task_progress(
-                task_id,
-                "Starting self-update from latest release".to_string(),
-                false,
-            )
-            .await;
+        self.client.clear_task_log_ack(task_id).await;
+        let log_sync_state = match TaskLogSyncState::new(&self.config.workspaces_path, task_id) {
+            Ok(state) => Arc::new(Mutex::new(state)),
+            Err(e) => {
+                error!(
+                    "Failed to initialize self-update log state for {}: {}",
+                    task_id, e
+                );
+                let _ = self
+                    .client
+                    .send_task_failed(task_id, format!("Failed to initialize task logs: {}", e))
+                    .await;
+                *self.update_in_progress.write().await = false;
+                return;
+            }
+        };
+
+        self.append_manual_task_log_line(
+            &log_sync_state,
+            "Starting self-update from latest release",
+            false,
+        )
+        .await;
 
         match self_update::perform_self_update(&self.config_path).await {
             Ok(update_result) => {
-                let _ = self
-                    .client
-                    .send_task_progress(
-                        task_id,
-                        format!(
-                            "Updater launched successfully for version {}. Agent will restart now.",
-                            update_result.target_version
-                        ),
-                        false,
-                    )
-                    .await;
+                self.append_manual_task_log_line(
+                    &log_sync_state,
+                    &format!(
+                        "Updater launched successfully for version {}. Agent will restart now.",
+                        update_result.target_version
+                    ),
+                    false,
+                )
+                .await;
 
                 let mut result = HashMap::new();
                 result.insert(
                     "target_version".to_string(),
                     serde_json::Value::String(update_result.target_version),
                 );
+
+                let fully_synced = self
+                    .flush_task_logs_until_synced(
+                        &log_sync_state,
+                        Duration::from_millis(LOG_FINAL_SYNC_TIMEOUT_MS),
+                    )
+                    .await;
+                if !fully_synced {
+                    warn!(
+                        "Self-update task {} log sync did not fully complete before completion",
+                        task_id
+                    );
+                }
 
                 if let Err(e) = self
                     .client
@@ -777,6 +956,12 @@ impl Agent {
             }
             Err(e) => {
                 error!("Self-update task {} failed: {}", task_id, e);
+                self.append_manual_task_log_line(
+                    &log_sync_state,
+                    &format!("Self-update failed: {}", e),
+                    true,
+                )
+                .await;
                 let _ = self
                     .client
                     .send_task_failed(task_id, format!("Self-update failed: {}", e))
@@ -784,6 +969,7 @@ impl Agent {
             }
         }
 
+        self.client.clear_task_log_ack(task_id).await;
         *self.update_in_progress.write().await = false;
     }
 }
