@@ -6,6 +6,11 @@ from pipeline.core.flow.activity import Service, StaticIntervalGenerator
 from pipeline.core.flow.io import StringItemSchema, ObjectItemSchema
 from components.schemas import ExtendedArraySchema, ExtendedStringSchema, ExtendedObjectSchema
 from client_agents.dispatch_stream import publish_dispatch_event
+from workflows.workspace import (
+    WORKSPACE_MODE_NONE,
+    WORKSPACE_MODE_SANDBOX,
+    WORKSPACE_MODE_WORKSPACE,
+)
 
 logger = logging.getLogger('django')
 
@@ -90,10 +95,9 @@ class ClientAgentService(Service):
         }
     
     def execute(self, data, parent_data):
-        from client_agents.models import AgentWorkspace
+        from client_agents.models import AgentWorkspace, ClientAgent
         from projects.models import Project
         
-        workspace_id = data.get_one_of_inputs('workspace_id')
         execution_mode = self._normalize_execution_mode(data.get_one_of_inputs('execution_mode', EXECUTION_MODE_COMMAND))
         command = str(data.get_one_of_inputs('command', '') or '').strip()
         code = self._normalize_code_input(data.get_one_of_inputs('code', {}))
@@ -101,6 +105,10 @@ class ClientAgentService(Service):
         parameters = data.get_one_of_inputs('parameters', [])
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         project_id = parent_data.get_one_of_inputs('project_id', '')
+        workspace_mode = str(data.get_one_of_inputs('workspace_mode', WORKSPACE_MODE_NONE) or WORKSPACE_MODE_NONE).strip().upper()
+        workspace_id = data.get_one_of_inputs('__workspace_id')
+        workspace_name = str(data.get_one_of_inputs('__workspace_name', '') or '').strip()
+        agent_name = str(data.get_one_of_inputs('__agent_name', '') or '').strip()
         
         if execution_mode == EXECUTION_MODE_COMMAND and not command:
             data.outputs.ex_data = 'Command is required when execution mode is command'
@@ -145,20 +153,40 @@ class ClientAgentService(Service):
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         data.set_outputs('_hb_timeout_miss_count', 0)
         data.set_outputs('_hb_last_seen_heartbeat', '')
-        
-        try:
-            workspace = AgentWorkspace.objects.get(id=workspace_id)
-        except AgentWorkspace.DoesNotExist:
-            data.outputs.ex_data = f'Workspace {workspace_id} not found'
-            return False
-            
-        success = self._dispatch_task(data, workspace)
-        return success if success else False
+
+        if workspace_mode == WORKSPACE_MODE_WORKSPACE:
+            if not workspace_id:
+                data.outputs.ex_data = 'System workspace_id is required when workspace_mode is WORKSPACE'
+                return False
+            try:
+                workspace = AgentWorkspace.objects.get(id=workspace_id)
+            except AgentWorkspace.DoesNotExist:
+                data.outputs.ex_data = f'Workspace {workspace_id} not found'
+                return False
+            success = self._dispatch_task(data, workspace=workspace, workspace_name=workspace.name, agent=workspace.agent)
+            return success if success else False
+
+        if workspace_mode == WORKSPACE_MODE_SANDBOX:
+            if not workspace_name or not agent_name:
+                data.outputs.ex_data = 'System workspace_name and agent_name are required when workspace_mode is SANDBOX'
+                return False
+            try:
+                agent = ClientAgent.objects.get(name=agent_name)
+            except ClientAgent.DoesNotExist:
+                data.outputs.ex_data = f'Client agent "{agent_name}" not found'
+                return False
+            if agent.status != 'ONLINE':
+                data.outputs.ex_data = f'Client agent "{agent_name}" is offline'
+                return False
+            success = self._dispatch_task(data, workspace=None, workspace_name=workspace_name, agent=agent)
+            return success if success else False
+
+        data.outputs.ex_data = f'workspace_mode {workspace_mode} does not provide an executable workspace'
+        return False
     
-    def _dispatch_task(self, data, workspace):
+    def _dispatch_task(self, data, *, workspace, workspace_name, agent):
         from client_agents.models import AgentTask
-        
-        agent = workspace.agent
+
         execution_mode = self._normalize_execution_mode(data.get_one_of_outputs('_execution_mode', EXECUTION_MODE_COMMAND))
         command = data.get_one_of_outputs('_command')
         display_command = str(data.get_one_of_outputs('_display_command', command) or '')
@@ -196,7 +224,7 @@ class ClientAgentService(Service):
                 payload={
                     "type": "task_dispatch",
                     "task_id": task_id,
-                    "workspace_name": workspace.name,
+                    "workspace_name": workspace_name,
                     "client_repo_url": client_repo_url,
                     "client_repo_ref": client_repo_ref,
                     "client_repo_token": client_repo_token,
@@ -322,7 +350,6 @@ class ClientAgentService(Service):
     
     def inputs_format(self):
         return [
-            self.InputItem(name='Workspace ID', key='workspace_id', type='int', required=True),
             self.InputItem(
                 name='Execution Mode',
                 key='execution_mode',

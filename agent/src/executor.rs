@@ -679,6 +679,27 @@ impl TaskRunner {
         None
     }
 
+    fn cleanup_workspace_dir_if_needed(
+        workspace_dir: &Path,
+        cleanup_workspace_on_success: bool,
+        result: &ExecutionResult,
+    ) {
+        if cleanup_workspace_on_success
+            && result.exit_code == 0
+            && !result.timed_out
+            && !result.cancelled
+        {
+            if let Err(e) = std::fs::remove_dir_all(workspace_dir) {
+                warn!(
+                    "Failed to cleanup workspace directory {:?}: {}",
+                    workspace_dir, e
+                );
+            } else {
+                info!("Cleaned up workspace directory {:?}", workspace_dir);
+            }
+        }
+    }
+
     /// 运行任务
     pub async fn run_task<F, Fut>(
         &self,
@@ -800,7 +821,7 @@ impl TaskRunner {
             }
 
             info!("No command specified, skipping script execution");
-            return ExecutionResult {
+            let result = ExecutionResult {
                 exit_code: 0,
                 stdout: String::new(),
                 stderr: String::new(),
@@ -808,6 +829,8 @@ impl TaskRunner {
                 cancelled: false,
                 result: HashMap::new(),
             };
+            Self::cleanup_workspace_dir_if_needed(&workspace_dir, cleanup_workspace_on_success, &result);
+            return result;
         }
 
         // 设置环境变量
@@ -923,20 +946,7 @@ impl TaskRunner {
             }
         }
 
-        if cleanup_workspace_on_success
-            && result.exit_code == 0
-            && !result.timed_out
-            && !result.cancelled
-        {
-            if let Err(e) = std::fs::remove_dir_all(&workspace_dir) {
-                warn!(
-                    "Failed to cleanup workspace directory {:?}: {}",
-                    workspace_dir, e
-                );
-            } else {
-                info!("Cleaned up workspace directory {:?}", workspace_dir);
-            }
-        }
+        Self::cleanup_workspace_dir_if_needed(&workspace_dir, cleanup_workspace_on_success, &result);
 
         result
     }
@@ -1092,7 +1102,10 @@ impl TaskRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::{StdoutCapture, RESULT_BEGIN_MARKER, RESULT_END_MARKER};
+    use super::{ExecutionResult, StdoutCapture, TaskRunner, RESULT_BEGIN_MARKER, RESULT_END_MARKER};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn stdout_capture_extracts_structured_result_and_hides_markers() {
@@ -1132,5 +1145,29 @@ mod tests {
             format!("prefix\n{}{{\"artifact\":\"demo.apk\"", RESULT_BEGIN_MARKER)
         );
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn cleanup_workspace_dir_if_needed_removes_directory_on_success() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let workspace_dir = std::env::temp_dir().join(format!("tasknexus_cleanup_test_{}", unique));
+        fs::create_dir_all(&workspace_dir).unwrap();
+        fs::write(workspace_dir.join("demo.txt"), "content").unwrap();
+
+        let result = ExecutionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            cancelled: false,
+            result: HashMap::new(),
+        };
+
+        TaskRunner::cleanup_workspace_dir_if_needed(&workspace_dir, true, &result);
+
+        assert!(!workspace_dir.exists());
     }
 }
