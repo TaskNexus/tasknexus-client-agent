@@ -103,6 +103,7 @@ class ClientAgentService(Service):
         code = self._normalize_code_input(data.get_one_of_inputs('code', {}))
         timeout = data.get_one_of_inputs('timeout', 3600)
         parameters = data.get_one_of_inputs('parameters', [])
+        project_environment = data.get_one_of_inputs('__project_environment', {})
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         project_id = parent_data.get_one_of_inputs('project_id', '')
         workspace_mode = str(data.get_one_of_inputs('workspace_mode', WORKSPACE_MODE_NONE) or WORKSPACE_MODE_NONE).strip().upper()
@@ -149,6 +150,7 @@ class ClientAgentService(Service):
         data.set_outputs('_client_repo_url', client_repo_url)
         data.set_outputs('_client_repo_ref', client_repo_ref)
         data.set_outputs('_client_repo_token', client_repo_token)
+        data.set_outputs('_project_environment', self._normalize_env_parameters(project_environment))
         data.set_outputs('_parameters', self._normalize_env_parameters(parameters))
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         data.set_outputs('_hb_timeout_miss_count', 0)
@@ -196,9 +198,10 @@ class ClientAgentService(Service):
         client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
         client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
         client_repo_token = data.get_one_of_outputs('_client_repo_token', '')
+        project_environment = self._normalize_env_parameters(data.get_one_of_outputs('_project_environment', {}))
         task_parameters = self._normalize_env_parameters(data.get_one_of_outputs('_parameters', {}))
         base_environment = self._normalize_env_parameters(agent.environment)
-        merged_environment = {**base_environment, **task_parameters}
+        merged_environment = {**base_environment, **project_environment, **task_parameters}
         
         try:
             agent_task = AgentTask.objects.create(
