@@ -59,14 +59,25 @@ class WorkspaceAcquireService(Service):
         client_repo_token = extra_config.get("agent_repo_token", "")
         return client_repo_url, client_repo_ref, client_repo_token
 
-    def _set_system_outputs(self, data, *, workspace_id="", workspace_name="", agent_name="", workspace_mode="", workspace_label=""):
+    def _set_system_outputs(
+        self,
+        data,
+        *,
+        workspace_id="",
+        workspace_name="",
+        agent_name="",
+        workspace_mode="",
+        workspace_label="",
+        workspace_agent_name="",
+    ):
         data.set_outputs("__workspace_id", workspace_id)
         data.set_outputs("__workspace_name", workspace_name)
         data.set_outputs("__agent_name", agent_name)
         data.set_outputs("workspace_mode", workspace_mode)
         data.set_outputs("workspace_label", workspace_label)
+        data.set_outputs("workspace_agent_name", workspace_agent_name)
 
-    def _try_acquire_workspace(self, workspace_label, pipeline_id=""):
+    def _try_acquire_workspace(self, workspace_label, pipeline_id="", workspace_agent_name=""):
         from client_agents.models import AgentWorkspace
 
         base_qs = AgentWorkspace.objects.filter(
@@ -74,6 +85,8 @@ class WorkspaceAcquireService(Service):
             agent__status="ONLINE",
             occupied_by__isnull=True,
         )
+        if workspace_agent_name:
+            base_qs = base_qs.filter(agent__name=workspace_agent_name)
 
         if workspace_label:
             workspace = base_qs.filter(labels__contains=[workspace_label]).order_by("?").first()
@@ -151,10 +164,13 @@ class WorkspaceAcquireService(Service):
             data.outputs.ex_data = f"Failed to dispatch workspace prepare task: {exc}"
             return False
 
-    def _select_online_agent(self):
+    def _select_online_agent(self, requested_agent_name=""):
         from client_agents.models import ClientAgent
 
-        return ClientAgent.objects.filter(status="ONLINE").order_by("name").first()
+        qs = ClientAgent.objects.filter(status="ONLINE")
+        if requested_agent_name:
+            qs = qs.filter(name=requested_agent_name)
+        return qs.order_by("name").first()
 
     def _build_sandbox_workspace_name(self, workspace_label):
         normalized = re.sub(r"[^A-Za-z0-9_-]+", "_", str(workspace_label or "").strip()).strip("_")
@@ -215,7 +231,20 @@ class WorkspaceAcquireService(Service):
             data.outputs.ex_data = f"Failed to dispatch sandbox prepare task: {exc}"
             return False
 
-    def _mark_ready(self, data, *, owner, resource_type, workspace_id="", workspace_name="", agent_name="", workspace_mode="", workspace_label="", borrowed_from=""):
+    def _mark_ready(
+        self,
+        data,
+        *,
+        owner,
+        resource_type,
+        workspace_id="",
+        workspace_name="",
+        agent_name="",
+        workspace_mode="",
+        workspace_label="",
+        workspace_agent_name="",
+        borrowed_from="",
+    ):
         self._set_system_outputs(
             data,
             workspace_id=workspace_id,
@@ -223,6 +252,7 @@ class WorkspaceAcquireService(Service):
             agent_name=agent_name,
             workspace_mode=workspace_mode,
             workspace_label=workspace_label,
+            workspace_agent_name=workspace_agent_name,
         )
         self._record_scope(
             phase="ready",
@@ -243,6 +273,7 @@ class WorkspaceAcquireService(Service):
         workspace_strategy = str(data.get_one_of_inputs("workspace_strategy", "") or "").strip().upper()
         workspace_mode = str(data.get_one_of_inputs("workspace_mode", WORKSPACE_MODE_NONE) or WORKSPACE_MODE_NONE).strip().upper()
         workspace_label = str(data.get_one_of_inputs("workspace_label", "") or "").strip()
+        workspace_agent_name = str(data.get_one_of_inputs("workspace_agent_name", "") or "").strip()
         inherited_workspace_id = data.get_one_of_inputs("__workspace_id", "")
         inherited_workspace_name = str(data.get_one_of_inputs("__workspace_name", "") or "").strip()
         inherited_agent_name = str(data.get_one_of_inputs("__agent_name", "") or "").strip()
@@ -265,6 +296,7 @@ class WorkspaceAcquireService(Service):
             agent_name=inherited_agent_name,
             workspace_mode=workspace_mode,
             workspace_label=workspace_label,
+            workspace_agent_name=workspace_agent_name,
         )
 
         if workspace_strategy == WORKSPACE_STRATEGY_REUSE_PARENT:
@@ -280,6 +312,7 @@ class WorkspaceAcquireService(Service):
                 agent_name=inherited_agent_name,
                 workspace_mode=workspace_mode,
                 workspace_label=workspace_label,
+                workspace_agent_name=workspace_agent_name,
             )
             self._record_scope(
                 phase="reused_parent",
@@ -304,6 +337,7 @@ class WorkspaceAcquireService(Service):
                 agent_name="",
                 workspace_mode=workspace_mode,
                 workspace_label="",
+                workspace_agent_name="",
             )
             self._record_scope(
                 phase="ready",
@@ -334,7 +368,11 @@ class WorkspaceAcquireService(Service):
             )
             data.set_outputs("_phase", "acquiring_workspace")
             data.set_outputs("_resource_type", "workspace")
-            workspace = self._try_acquire_workspace(workspace_label, pipeline_id)
+            workspace = self._try_acquire_workspace(
+                workspace_label,
+                pipeline_id,
+                workspace_agent_name,
+            )
             if not workspace:
                 self._record_scope(phase="waiting")
                 data.set_outputs("_phase", "waiting")
@@ -351,6 +389,7 @@ class WorkspaceAcquireService(Service):
                     agent_name=workspace.agent.name,
                     workspace_mode=workspace_mode,
                     workspace_label=workspace_label,
+                    workspace_agent_name=workspace_agent_name,
                 )
                 self._record_scope(
                     phase="preparing_repo",
@@ -375,6 +414,7 @@ class WorkspaceAcquireService(Service):
                 agent_name=workspace.agent.name,
                 workspace_mode=workspace_mode,
                 workspace_label=workspace_label,
+                workspace_agent_name=workspace_agent_name,
             )
 
         if workspace_mode == WORKSPACE_MODE_SANDBOX:
@@ -391,9 +431,14 @@ class WorkspaceAcquireService(Service):
             )
             data.set_outputs("_phase", "selecting_agent")
             data.set_outputs("_resource_type", "sandbox")
-            agent = self._select_online_agent()
+            agent = self._select_online_agent(workspace_agent_name)
             if not agent:
-                data.outputs.ex_data = "No online agent available for sandbox mode"
+                if workspace_agent_name:
+                    data.outputs.ex_data = (
+                        f'Requested agent "{workspace_agent_name}" is not available online for sandbox mode'
+                    )
+                else:
+                    data.outputs.ex_data = "No online agent available for sandbox mode"
                 return False
 
             workspace_name = self._build_sandbox_workspace_name(workspace_label)
@@ -406,6 +451,7 @@ class WorkspaceAcquireService(Service):
                 agent_name=agent.name,
                 workspace_mode=workspace_mode,
                 workspace_label=workspace_label,
+                workspace_agent_name=workspace_agent_name,
             )
             self._record_scope(
                 phase="preparing_repo",
@@ -430,6 +476,7 @@ class WorkspaceAcquireService(Service):
         phase = data.get_one_of_outputs("_phase", "waiting")
         workspace_mode = str(data.get_one_of_outputs("workspace_mode", "") or "").strip().upper()
         workspace_label = str(data.get_one_of_outputs("workspace_label", "") or "").strip()
+        workspace_agent_name = str(data.get_one_of_outputs("workspace_agent_name", "") or "").strip()
 
         if phase in {"ready", "reused_parent"}:
             self.finish_schedule()
@@ -446,7 +493,11 @@ class WorkspaceAcquireService(Service):
                     return False
 
             pipeline_id = data.get_one_of_outputs("_pipeline_id", "")
-            workspace = self._try_acquire_workspace(workspace_label, pipeline_id)
+            workspace = self._try_acquire_workspace(
+                workspace_label,
+                pipeline_id,
+                workspace_agent_name,
+            )
             if not workspace:
                 self._record_scope(phase="waiting")
                 data.set_outputs("_phase", "waiting")
@@ -461,6 +512,7 @@ class WorkspaceAcquireService(Service):
                     agent_name=workspace.agent.name,
                     workspace_mode=workspace_mode,
                     workspace_label=workspace_label,
+                    workspace_agent_name=workspace_agent_name,
                 )
                 self._record_scope(
                     phase="preparing_repo",
@@ -485,6 +537,7 @@ class WorkspaceAcquireService(Service):
                 agent_name=workspace.agent.name,
                 workspace_mode=workspace_mode,
                 workspace_label=workspace_label,
+                workspace_agent_name=workspace_agent_name,
             )
 
         if phase == "preparing_repo":
@@ -511,6 +564,7 @@ class WorkspaceAcquireService(Service):
                     agent_name=str(data.get_one_of_outputs("__agent_name", "") or ""),
                     workspace_mode=workspace_mode,
                     workspace_label=workspace_label,
+                    workspace_agent_name=workspace_agent_name,
                 )
 
             if task.status in {"FAILED", "TIMEOUT", "CANCELLED"}:
@@ -528,6 +582,7 @@ class WorkspaceAcquireService(Service):
             self.InputItem(name="Workspace Strategy", key="workspace_strategy", type="string", required=False),
             self.InputItem(name="Workspace Mode", key="workspace_mode", type="string", required=False),
             self.InputItem(name="Workspace Label", key="workspace_label", type="string", required=False),
+            self.InputItem(name="Workspace Agent Name", key="workspace_agent_name", type="string", required=False),
             self.InputItem(name="Inherited Workspace ID", key="__workspace_id", type="string", required=False),
             self.InputItem(name="Inherited Workspace Name", key="__workspace_name", type="string", required=False),
             self.InputItem(name="Inherited Agent Name", key="__agent_name", type="string", required=False),
@@ -541,6 +596,7 @@ class WorkspaceAcquireService(Service):
             self.OutputItem(name="Agent Name", key="__agent_name", type="string"),
             self.OutputItem(name="Workspace Mode", key="workspace_mode", type="string"),
             self.OutputItem(name="Workspace Label", key="workspace_label", type="string"),
+            self.OutputItem(name="Workspace Agent Name", key="workspace_agent_name", type="string"),
         ]
 
 
