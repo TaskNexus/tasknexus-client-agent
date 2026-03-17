@@ -93,6 +93,90 @@ class ClientAgentService(Service):
             'language': language,
             'content': content,
         }
+
+    @staticmethod
+    def _normalize_output_bindings(raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+            if not raw_value:
+                return []
+            try:
+                raw_value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                return []
+
+        if not isinstance(raw_value, list):
+            return []
+
+        normalized = []
+        for item in raw_value:
+            if not isinstance(item, dict):
+                continue
+            output_key = str(item.get('output_key') or item.get('outputKey') or '').strip()
+            source = str(item.get('source') or '').strip()
+            if not output_key or not source:
+                continue
+            normalized.append({
+                'output_key': output_key,
+                'source': source,
+            })
+        return normalized
+
+    @staticmethod
+    def _resolve_output_binding_source(source, *, task_id=None, exit_code=None, stdout='', stderr='', result=None):
+        result = result if isinstance(result, dict) else {}
+        normalized_source = str(source or '').strip()
+        if not normalized_source:
+            return None
+
+        if normalized_source == 'task_id':
+            return task_id
+        if normalized_source == 'exit_code':
+            return exit_code
+        if normalized_source == 'stdout':
+            return stdout
+        if normalized_source == 'stderr':
+            return stderr
+        if normalized_source == 'result':
+            return result
+
+        if normalized_source.startswith('result.'):
+            current = result
+            for segment in normalized_source.split('.')[1:]:
+                key = segment.strip()
+                if not key:
+                    return None
+                if isinstance(current, dict):
+                    if key not in current:
+                        return None
+                    current = current[key]
+                    continue
+                if isinstance(current, list) and key.isdigit():
+                    index = int(key)
+                    if index < 0 or index >= len(current):
+                        return None
+                    current = current[index]
+                    continue
+                return None
+            return current
+
+        return None
+
+    def _apply_output_bindings(self, data, bindings, *, task_id=None, exit_code=None, stdout='', stderr='', result=None):
+        normalized_bindings = self._normalize_output_bindings(bindings)
+        if not normalized_bindings:
+            return
+
+        for binding in normalized_bindings:
+            resolved = self._resolve_output_binding_source(
+                binding.get('source'),
+                task_id=task_id,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                result=result,
+            )
+            data.set_outputs(binding['output_key'], resolved)
     
     def execute(self, data, parent_data):
         from client_agents.models import AgentWorkspace, ClientAgent
@@ -103,6 +187,7 @@ class ClientAgentService(Service):
         code = self._normalize_code_input(data.get_one_of_inputs('code', {}))
         timeout = data.get_one_of_inputs('timeout', 3600)
         parameters = data.get_one_of_inputs('parameters', [])
+        output_bindings = data.get_one_of_inputs('__plugin_output_bindings', [])
         project_environment = data.get_one_of_inputs('__project_environment', {})
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         project_id = parent_data.get_one_of_inputs('project_id', '')
@@ -152,6 +237,7 @@ class ClientAgentService(Service):
         data.set_outputs('_client_repo_token', client_repo_token)
         data.set_outputs('_project_environment', self._normalize_env_parameters(project_environment))
         data.set_outputs('_parameters', self._normalize_env_parameters(parameters))
+        data.set_outputs('_plugin_output_bindings', self._normalize_output_bindings(output_bindings))
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         data.set_outputs('_hb_timeout_miss_count', 0)
         data.set_outputs('_hb_last_seen_heartbeat', '')
@@ -274,10 +360,20 @@ class ClientAgentService(Service):
             return True
         
         if status in ['COMPLETED', 'FAILED', 'TIMEOUT']:
+            normalized_result = task.result if isinstance(task.result, dict) else {}
             data.set_outputs('exit_code', task.exit_code if task.exit_code is not None else -1)
             data.set_outputs('stdout', task.stdout)
             data.set_outputs('stderr', task.stderr)
-            data.set_outputs('result', task.result if isinstance(task.result, dict) else {})
+            data.set_outputs('result', normalized_result)
+            self._apply_output_bindings(
+                data,
+                data.get_one_of_outputs('_plugin_output_bindings', []),
+                task_id=task_id,
+                exit_code=task.exit_code if task.exit_code is not None else -1,
+                stdout=task.stdout,
+                stderr=task.stderr,
+                result=normalized_result,
+            )
             data.outputs.ex_data = task.error_message
             data.set_outputs('_hb_timeout_miss_count', 0)
             data.set_outputs('_hb_last_seen_heartbeat', '')
