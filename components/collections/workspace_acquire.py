@@ -72,6 +72,7 @@ class WorkspaceAcquireService(Service):
         base_qs = AgentWorkspace.objects.filter(
             status="IDLE",
             agent__status="ONLINE",
+            occupied_by__isnull=True,
         )
 
         if workspace_label:
@@ -85,7 +86,7 @@ class WorkspaceAcquireService(Service):
         with transaction.atomic():
             locked = (
                 AgentWorkspace.objects.select_for_update(nowait=True)
-                .filter(id=workspace.id, status="IDLE")
+                .filter(id=workspace.id, status="IDLE", occupied_by__isnull=True)
                 .first()
             )
             if not locked:
