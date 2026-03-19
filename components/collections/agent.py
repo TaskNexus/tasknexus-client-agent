@@ -10,6 +10,7 @@ from workflows.workspace import (
     WORKSPACE_MODE_NONE,
     WORKSPACE_MODE_SANDBOX,
     WORKSPACE_MODE_WORKSPACE,
+    SYSTEM_WORKSPACE_INPUT_KEYS,
 )
 
 logger = logging.getLogger('django')
@@ -20,6 +21,13 @@ HEARTBEAT_TIMEOUT_RETRY = 3
 EXECUTION_MODE_COMMAND = 'command'
 EXECUTION_MODE_CODE = 'code'
 ALLOWED_CODE_LANGUAGES = {'shell', 'python'}
+ROOT_SYSTEM_INPUT_KEYS = {
+    'project_id',
+    'pipeline_id',
+    'task_created_by',
+    'task_started_at',
+    *SYSTEM_WORKSPACE_INPUT_KEYS,
+}
 
 class ClientAgentService(Service):
     __need_schedule__ = True
@@ -57,6 +65,35 @@ class ClientAgentService(Service):
                 normalized[key] = '' if value is None else str(value)
 
         return normalized
+
+    @staticmethod
+    def _stringify_environment_value(value):
+        if value is None:
+            return ''
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    @classmethod
+    def _collect_declared_environment(cls, parent_data):
+        raw_inputs = getattr(parent_data, 'inputs', {}) or {}
+        if not isinstance(raw_inputs, dict):
+            return {}
+
+        declared_environment = {}
+        for key, value in raw_inputs.items():
+            normalized_key = str(key or '').strip()
+            if not normalized_key:
+                continue
+            if normalized_key in ROOT_SYSTEM_INPUT_KEYS:
+                continue
+            if normalized_key.startswith('tn_') or normalized_key.startswith('__'):
+                continue
+            declared_environment[normalized_key] = cls._stringify_environment_value(value)
+
+        return declared_environment
 
     @staticmethod
     def _normalize_execution_mode(raw_mode):
@@ -188,7 +225,7 @@ class ClientAgentService(Service):
         timeout = data.get_one_of_inputs('timeout', 3600)
         parameters = data.get_one_of_inputs('parameters', [])
         output_bindings = data.get_one_of_inputs('__plugin_output_bindings', [])
-        project_environment = data.get_one_of_inputs('__project_environment', {})
+        declared_environment = self._collect_declared_environment(parent_data)
         pipeline_id = parent_data.get_one_of_inputs('pipeline_id', '')
         project_id = parent_data.get_one_of_inputs('project_id', '')
         workspace_mode = str(data.get_one_of_inputs('workspace_mode', WORKSPACE_MODE_NONE) or WORKSPACE_MODE_NONE).strip().upper()
@@ -235,7 +272,7 @@ class ClientAgentService(Service):
         data.set_outputs('_client_repo_url', client_repo_url)
         data.set_outputs('_client_repo_ref', client_repo_ref)
         data.set_outputs('_client_repo_token', client_repo_token)
-        data.set_outputs('_project_environment', self._normalize_env_parameters(project_environment))
+        data.set_outputs('_declared_environment', self._normalize_env_parameters(declared_environment))
         data.set_outputs('_parameters', self._normalize_env_parameters(parameters))
         data.set_outputs('_plugin_output_bindings', self._normalize_output_bindings(output_bindings))
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
@@ -284,10 +321,10 @@ class ClientAgentService(Service):
         client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
         client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
         client_repo_token = data.get_one_of_outputs('_client_repo_token', '')
-        project_environment = self._normalize_env_parameters(data.get_one_of_outputs('_project_environment', {}))
+        declared_environment = self._normalize_env_parameters(data.get_one_of_outputs('_declared_environment', {}))
         task_parameters = self._normalize_env_parameters(data.get_one_of_outputs('_parameters', {}))
         base_environment = self._normalize_env_parameters(agent.environment)
-        merged_environment = {**base_environment, **project_environment, **task_parameters}
+        merged_environment = {**base_environment, **declared_environment, **task_parameters}
         
         try:
             agent_task = AgentTask.objects.create(
