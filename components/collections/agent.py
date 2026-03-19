@@ -51,7 +51,7 @@ class ClientAgentService(Service):
                 key = str(key).strip()
                 if not key:
                     continue
-                normalized[key] = '' if value is None else str(value)
+                normalized[key] = value
             return normalized
 
         if isinstance(raw_value, list):
@@ -61,8 +61,7 @@ class ClientAgentService(Service):
                 key = str(item.get('key', '')).strip()
                 if not key:
                     continue
-                value = item.get('value', '')
-                normalized[key] = '' if value is None else str(value)
+                normalized[key] = item.get('value')
 
         return normalized
 
@@ -91,7 +90,7 @@ class ClientAgentService(Service):
                 continue
             if normalized_key.startswith('tn_') or normalized_key.startswith('__'):
                 continue
-            declared_environment[normalized_key] = cls._stringify_environment_value(value)
+            declared_environment[normalized_key] = value
 
         return declared_environment
 
@@ -324,7 +323,10 @@ class ClientAgentService(Service):
         declared_environment = self._normalize_env_parameters(data.get_one_of_outputs('_declared_environment', {}))
         task_parameters = self._normalize_env_parameters(data.get_one_of_outputs('_parameters', {}))
         base_environment = self._normalize_env_parameters(agent.environment)
-        merged_environment = {**base_environment, **declared_environment, **task_parameters}
+        merged_environment = {
+            key: self._stringify_environment_value(value)
+            for key, value in {**base_environment, **declared_environment, **task_parameters}.items()
+        }
         
         try:
             agent_task = AgentTask.objects.create(
