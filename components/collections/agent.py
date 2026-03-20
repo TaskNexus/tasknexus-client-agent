@@ -25,6 +25,7 @@ ROOT_SYSTEM_INPUT_KEYS = {
     'project_id',
     'pipeline_id',
     'task_created_by',
+    'task_create_username',
     'task_started_at',
     *SYSTEM_WORKSPACE_INPUT_KEYS,
 }
@@ -93,6 +94,19 @@ class ClientAgentService(Service):
             declared_environment[normalized_key] = value
 
         return declared_environment
+
+    @staticmethod
+    def _collect_project_global_environment(extra_config):
+        from projects.env_params import get_normalized_global_params
+
+        project_environment = {}
+        for param in get_normalized_global_params(extra_config):
+            key = str(param.get('key', '') or '').strip()
+            if not key:
+                continue
+            project_environment[key] = param.get('default')
+
+        return project_environment
 
     @staticmethod
     def _normalize_execution_mode(raw_mode):
@@ -248,6 +262,7 @@ class ClientAgentService(Service):
         client_repo_url = ''
         client_repo_ref = 'main'
         client_repo_token = ''
+        project_environment = {}
         if project_id:
             try:
                 project = Project.objects.get(id=project_id)
@@ -255,6 +270,7 @@ class ClientAgentService(Service):
                 client_repo_url = extra_config.get('agent_repo_url', '')
                 client_repo_ref = extra_config.get('agent_repo_ref', 'main')
                 client_repo_token = extra_config.get('agent_repo_token', '')
+                project_environment = self._collect_project_global_environment(extra_config)
             except Project.DoesNotExist:
                 pass
         
@@ -271,6 +287,7 @@ class ClientAgentService(Service):
         data.set_outputs('_client_repo_url', client_repo_url)
         data.set_outputs('_client_repo_ref', client_repo_ref)
         data.set_outputs('_client_repo_token', client_repo_token)
+        data.set_outputs('_project_environment', self._normalize_env_parameters(project_environment))
         data.set_outputs('_declared_environment', self._normalize_env_parameters(declared_environment))
         data.set_outputs('_parameters', self._normalize_env_parameters(parameters))
         data.set_outputs('_plugin_output_bindings', self._normalize_output_bindings(output_bindings))
@@ -320,12 +337,18 @@ class ClientAgentService(Service):
         client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
         client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
         client_repo_token = data.get_one_of_outputs('_client_repo_token', '')
+        project_environment = self._normalize_env_parameters(data.get_one_of_outputs('_project_environment', {}))
         declared_environment = self._normalize_env_parameters(data.get_one_of_outputs('_declared_environment', {}))
         task_parameters = self._normalize_env_parameters(data.get_one_of_outputs('_parameters', {}))
         base_environment = self._normalize_env_parameters(agent.environment)
         merged_environment = {
             key: self._stringify_environment_value(value)
-            for key, value in {**base_environment, **declared_environment, **task_parameters}.items()
+            for key, value in {
+                **project_environment,
+                **base_environment,
+                **declared_environment,
+                **task_parameters,
+            }.items()
         }
         
         try:
