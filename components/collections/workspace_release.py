@@ -42,5 +42,5 @@ class WorkspaceReleaseComponent(Component):
     bound_service = WorkspaceReleaseService
     version = '1.0'
     category = 'ClientAgent'
-    icon = "Computer"
+    icon = "faComputer"
     description = '释放工作空间'

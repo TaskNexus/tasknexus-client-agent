@@ -606,5 +606,5 @@ class WorkspaceAcquireComponent(Component):
     bound_service = WorkspaceAcquireService
     version = "1.0"
     category = "ClientAgent"
-    icon = "Computer"
+    icon = "faComputer"
     description = "获取并锁定工作空间，并克隆/更新代码仓库"

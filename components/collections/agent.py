@@ -570,5 +570,5 @@ class ClientAgentComponent(Component):
     bound_service = ClientAgentService
     version = '1.3'
     category = 'ClientAgent'
-    icon = "Computer"
+    icon = "faComputer"
     description = '将脚本分发给客户端代理执行'
