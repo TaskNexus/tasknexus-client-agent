@@ -846,6 +846,26 @@ impl TaskRunner {
             task_env.extend(env);
         }
 
+        // Install Python dependencies if needed (before command execution)
+        let is_python = if normalized_mode == "code" {
+            code.map(|c| c.language.trim().eq_ignore_ascii_case("python"))
+                .unwrap_or(false)
+        } else {
+            command.ends_with(".py")
+        };
+
+        if is_python {
+            if let Some(ref repo_name) = repo_name {
+                let repo_dir = workspace_dir.join(repo_name);
+                if let Some(dep_result) = self
+                    .ensure_python_deps(&repo_dir, on_output.clone())
+                    .await
+                {
+                    return dep_result;
+                }
+            }
+        }
+
         let mut temp_code_path: Option<PathBuf> = None;
         let actual_command = if normalized_mode == "code" {
             let inline_code = match code {
@@ -1002,6 +1022,71 @@ impl TaskRunner {
                 script_path, script_path
             )
         }
+    }
+
+    fn build_pip_install_command(requirements_file: &str) -> String {
+        #[cfg(windows)]
+        {
+            // Windows 上 pip 可能不在 PATH 中，使用 python -m pip 更可靠
+            format!("python -m pip install -r {}", requirements_file)
+        }
+        #[cfg(not(windows))]
+        {
+            format!(
+                "if command -v pip3 >/dev/null 2>&1; then pip3 install -r {}; else pip install -r {}; fi",
+                requirements_file, requirements_file
+            )
+        }
+    }
+
+    /// Install Python dependencies from requirements.txt if present
+    async fn ensure_python_deps<F, Fut>(
+        &self,
+        repo_dir: &Path,
+        on_output: Option<F>,
+    ) -> Option<ExecutionResult>
+    where
+        F: Fn(String, bool) -> Fut + Send + Clone + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let requirements_path = repo_dir.join("requirements.txt");
+        if !requirements_path.exists() {
+            debug!(
+                "No requirements.txt found in {:?}, skipping pip install",
+                repo_dir
+            );
+            return None;
+        }
+
+        info!(
+            "Installing Python dependencies from {:?}",
+            requirements_path
+        );
+
+        let pip_cmd = Self::build_pip_install_command("requirements.txt");
+
+        let result = self
+            .executor
+            .execute(
+                &pip_cmd,
+                Some(repo_dir),
+                Some(&self.base_env),
+                Some(300), // 5 minutes for pip install
+                on_output,
+                None,
+            )
+            .await;
+
+        if result.exit_code != 0 {
+            warn!(
+                "Failed to install Python dependencies (exit code {})",
+                result.exit_code
+            );
+            return Some(result);
+        }
+
+        info!("Python dependencies installed successfully");
+        None
     }
 
     /// Inject token into an HTTPS URL for authenticated git operations
