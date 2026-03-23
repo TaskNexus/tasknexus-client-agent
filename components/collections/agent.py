@@ -245,7 +245,8 @@ class ClientAgentService(Service):
         workspace_id = data.get_one_of_inputs('__workspace_id')
         workspace_name = str(data.get_one_of_inputs('__workspace_name', '') or '').strip()
         agent_name = str(data.get_one_of_inputs('__agent_name', '') or '').strip()
-        
+        webhook_data = parent_data.get_one_of_inputs('webhook_payload', {})
+
         if execution_mode == EXECUTION_MODE_COMMAND and not command:
             data.outputs.ex_data = 'Command is required when execution mode is command'
             return False
@@ -294,6 +295,7 @@ class ClientAgentService(Service):
         data.set_outputs('_wait_start_time', timezone.now().isoformat())
         data.set_outputs('_hb_timeout_miss_count', 0)
         data.set_outputs('_hb_last_seen_heartbeat', '')
+        data.set_outputs('_tn_webhook_data', webhook_data)
 
         if workspace_mode == WORKSPACE_MODE_WORKSPACE:
             if not workspace_id:
@@ -337,13 +339,16 @@ class ClientAgentService(Service):
         client_repo_url = data.get_one_of_outputs('_client_repo_url', '')
         client_repo_ref = data.get_one_of_outputs('_client_repo_ref', 'main')
         client_repo_token = data.get_one_of_outputs('_client_repo_token', '')
+        webhook_data = self._normalize_env_parameters(data.get_one_of_outputs('_tn_webhook_data', {}))
         project_environment = self._normalize_env_parameters(data.get_one_of_outputs('_project_environment', {}))
         declared_environment = self._normalize_env_parameters(data.get_one_of_outputs('_declared_environment', {}))
         task_parameters = self._normalize_env_parameters(data.get_one_of_outputs('_parameters', {}))
         base_environment = self._normalize_env_parameters(agent.environment)
+
         merged_environment = {
             key: self._stringify_environment_value(value)
             for key, value in {
+                **webhook_data,
                 **project_environment,
                 **base_environment,
                 **declared_environment,
