@@ -19,7 +19,7 @@ from workflows.workspace import (
 
 logger = logging.getLogger("django")
 
-MAX_WAIT_FOR_WORKSPACE = 600
+MAX_WAIT_FOR_WORKSPACE = 3600
 MAX_SANDBOX_WORKSPACE_PREFIX_LENGTH = 48
 
 
