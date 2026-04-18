@@ -355,6 +355,19 @@ class ClientAgentService(Service):
                 **task_parameters,
             }.items()
         }
+        dispatch_payload = {
+            "type": "task_dispatch",
+            "task_id": None,
+            "workspace_name": workspace_name,
+            "client_repo_url": client_repo_url,
+            "client_repo_ref": client_repo_ref,
+            "client_repo_token": client_repo_token,
+            "execution_mode": execution_mode,
+            "command": command,
+            "code": code,
+            "timeout": timeout,
+            "environment": merged_environment,
+        }
         
         try:
             agent_task = AgentTask.objects.create(
@@ -364,8 +377,11 @@ class ClientAgentService(Service):
                 command=display_command,
                 timeout=timeout,
                 status='PENDING',
+                dispatch_payload=dispatch_payload,
             )
             task_id = agent_task.id
+            dispatch_payload["task_id"] = task_id
+            AgentTask.objects.filter(id=task_id).update(dispatch_payload=dispatch_payload)
             
             data.set_outputs('task_id', task_id)
             data.set_outputs('_dispatch_time', timezone.now().isoformat())
@@ -377,19 +393,7 @@ class ClientAgentService(Service):
             publish_dispatch_event(
                 task_id=task_id,
                 agent_id=agent.id,
-                payload={
-                    "type": "task_dispatch",
-                    "task_id": task_id,
-                    "workspace_name": workspace_name,
-                    "client_repo_url": client_repo_url,
-                    "client_repo_ref": client_repo_ref,
-                    "client_repo_token": client_repo_token,
-                    "execution_mode": execution_mode,
-                    "command": command,
-                    "code": code,
-                    "timeout": timeout,
-                    "environment": merged_environment,
-                },
+                payload=dispatch_payload,
             )
             return True
             

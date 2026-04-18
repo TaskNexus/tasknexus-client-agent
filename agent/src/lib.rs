@@ -7,6 +7,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod executor;
+pub mod persisted_state;
 pub mod self_update;
 
 pub use client::AgentClient;

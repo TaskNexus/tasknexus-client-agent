@@ -829,7 +829,11 @@ impl TaskRunner {
                 cancelled: false,
                 result: HashMap::new(),
             };
-            Self::cleanup_workspace_dir_if_needed(&workspace_dir, cleanup_workspace_on_success, &result);
+            Self::cleanup_workspace_dir_if_needed(
+                &workspace_dir,
+                cleanup_workspace_on_success,
+                &result,
+            );
             return result;
         }
 
@@ -857,9 +861,8 @@ impl TaskRunner {
         if is_python {
             if let Some(ref repo_name) = repo_name {
                 let repo_dir = workspace_dir.join(repo_name);
-                if let Some(dep_result) = self
-                    .ensure_python_deps(&repo_dir, on_output.clone())
-                    .await
+                if let Some(dep_result) =
+                    self.ensure_python_deps(&repo_dir, on_output.clone()).await
                 {
                     return dep_result;
                 }
@@ -966,7 +969,11 @@ impl TaskRunner {
             }
         }
 
-        Self::cleanup_workspace_dir_if_needed(&workspace_dir, cleanup_workspace_on_success, &result);
+        Self::cleanup_workspace_dir_if_needed(
+            &workspace_dir,
+            cleanup_workspace_on_success,
+            &result,
+        );
 
         result
     }
@@ -1187,7 +1194,9 @@ impl TaskRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionResult, StdoutCapture, TaskRunner, RESULT_BEGIN_MARKER, RESULT_END_MARKER};
+    use super::{
+        ExecutionResult, StdoutCapture, TaskRunner, RESULT_BEGIN_MARKER, RESULT_END_MARKER,
+    };
     use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};

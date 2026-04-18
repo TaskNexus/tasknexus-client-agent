@@ -16,9 +16,13 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use tasknexus_agent::{
     autostart::AutoStartManager,
-    client::{AgentClient, AgentUpdateData, TaskDispatchData},
+    client::{
+        AgentClient, AgentUpdateData, StateSyncAction, StateSyncPayload, StateSyncTask,
+        TaskDispatchData, TaskStateAckData,
+    },
     config::{load_config, AgentConfig},
     executor::TaskRunner,
+    persisted_state::PersistedStateStore,
     self_update,
 };
 
@@ -468,13 +472,18 @@ struct Agent {
     config_path: PathBuf,
     task_runner: TaskRunner,
     client: AgentClient,
-    /// Maps task_id -> (workspace_name, cancel_sender)
-    running_tasks: Arc<RwLock<HashMap<i64, (String, watch::Sender<bool>)>>>,
+    /// Maps task_id -> (workspace_name, cancel_sender, local_log_path)
+    running_tasks: Arc<RwLock<HashMap<i64, (String, watch::Sender<bool>, PathBuf)>>>,
+    persisted_state: Arc<Mutex<PersistedStateStore>>,
     update_in_progress: Arc<RwLock<bool>>,
 }
 
 impl Agent {
-    fn new(config: AgentConfig, config_path: PathBuf) -> Self {
+    fn new(
+        config: AgentConfig,
+        config_path: PathBuf,
+        persisted_state: PersistedStateStore,
+    ) -> Self {
         let task_runner = TaskRunner::new(config.workspaces_path.clone(), config.proxy_env());
         let client = AgentClient::new(config.clone());
 
@@ -484,6 +493,7 @@ impl Agent {
             task_runner,
             client,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
+            persisted_state: Arc::new(Mutex::new(persisted_state)),
             update_in_progress: Arc::new(RwLock::new(false)),
         }
     }
@@ -541,6 +551,165 @@ impl Agent {
         }
     }
 
+    async fn save_persisted_state(&self) {
+        let store = self.persisted_state.lock().await;
+        if let Err(e) = store.save() {
+            error!("Failed to persist agent task state: {}", e);
+        }
+    }
+
+    async fn send_state_sync_snapshot(&self) {
+        let mut tasks = {
+            let store = self.persisted_state.lock().await;
+            store
+                .snapshot()
+                .iter()
+                .map(StateSyncTask::from_persisted)
+                .collect::<Vec<_>>()
+        };
+        let running = self.running_tasks.read().await;
+        for (task_id, (workspace_name, _, log_path)) in running.iter() {
+            if tasks.iter().any(|task| task.task_id == *task_id) {
+                continue;
+            }
+            tasks.push(StateSyncTask {
+                task_id: *task_id,
+                local_state: "RUNNING".to_string(),
+                workspace_name: workspace_name.clone(),
+                final_payload: serde_json::Value::Object(serde_json::Map::new()),
+                has_local_log: !log_path.as_os_str().is_empty(),
+            });
+        }
+        tasks.sort_by_key(|task| task.task_id);
+
+        if let Err(e) = self.client.send_state_sync(tasks).await {
+            warn!("Failed to send state sync snapshot: {}", e);
+        }
+    }
+
+    async fn clear_persisted_task_state(&self, task_id: i64) {
+        let removed = {
+            let mut store = self.persisted_state.lock().await;
+            store.remove(task_id)
+        };
+        self.save_persisted_state().await;
+
+        let local_log_path = removed
+            .map(|state| state.local_log_path)
+            .filter(|path| !path.is_empty());
+        let is_running = self.running_tasks.read().await.contains_key(&task_id);
+        if !is_running {
+            if let Some(path) = local_log_path {
+                self.cleanup_persisted_task_files(&path);
+            }
+        }
+    }
+
+    async fn handle_state_sync_result(&self, actions: Vec<StateSyncAction>) {
+        for action in actions {
+            match action.action.as_str() {
+                "start" => {
+                    if let Some(payload) = action.payload {
+                        match payload {
+                            StateSyncPayload::TaskDispatch {
+                                task_id,
+                                workspace_name,
+                                execution_mode,
+                                command,
+                                code,
+                                client_repo_url,
+                                client_repo_ref,
+                                client_repo_token,
+                                timeout,
+                                environment,
+                                prepare_repo_before_execute,
+                                cleanup_workspace_on_success,
+                            } => {
+                                self.client.clear_task_log_ack(task_id).await;
+                                self.clear_persisted_task_state(task_id).await;
+                                self.handle_task_dispatch(TaskDispatchData {
+                                    task_id,
+                                    workspace_name,
+                                    execution_mode,
+                                    command,
+                                    code,
+                                    client_repo_url,
+                                    client_repo_ref,
+                                    client_repo_token,
+                                    timeout,
+                                    environment,
+                                    prepare_repo_before_execute,
+                                    cleanup_workspace_on_success,
+                                })
+                                .await;
+                            }
+                            StateSyncPayload::AgentUpdate { task_id } => {
+                                self.handle_agent_update(AgentUpdateData { task_id }).await;
+                            }
+                        }
+                    }
+                }
+                "keep_running" => {
+                    self.client
+                        .record_task_log_ack(action.task_id, action.server_log_offset)
+                        .await;
+                }
+                "cancel" => {
+                    self.handle_task_cancel(action.task_id).await;
+                    self.clear_persisted_task_state(action.task_id).await;
+                }
+                "clear" => {
+                    self.clear_persisted_task_state(action.task_id).await;
+                }
+                other => {
+                    warn!(
+                        "Ignoring unknown state sync action '{}' for task {}",
+                        other, action.task_id
+                    );
+                }
+            }
+        }
+    }
+
+    async fn handle_task_state_ack(&self, ack: TaskStateAckData) {
+        if ack.accepted {
+            match ack.status.as_str() {
+                "RUNNING" => {
+                    return;
+                }
+                "COMPLETED" | "FAILED" | "CANCELLED" | "TIMEOUT" => {
+                    self.clear_persisted_task_state(ack.task_id).await;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if matches!(
+            ack.status.as_str(),
+            "COMPLETED" | "FAILED" | "CANCELLED" | "TIMEOUT"
+        ) {
+            if self.running_tasks.read().await.contains_key(&ack.task_id) {
+                self.handle_task_cancel(ack.task_id).await;
+            }
+            self.clear_persisted_task_state(ack.task_id).await;
+        }
+    }
+
+    fn cleanup_persisted_task_files(&self, local_log_path: &str) {
+        if local_log_path.is_empty() {
+            return;
+        }
+        if let Err(e) = fs::remove_file(local_log_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "Failed to cleanup persisted local task log '{}': {}",
+                    local_log_path, e
+                );
+            }
+        }
+    }
+
     async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting TaskNexus Agent: {}", self.config.name);
         info!("Server: {}", self.config.server);
@@ -553,6 +722,8 @@ impl Agent {
         let agent_clone = agent.clone();
         let agent_cancel = agent.clone();
         let agent_update = agent.clone();
+        let agent_sync = agent.clone();
+        let agent_ack = agent.clone();
 
         // 运行客户端
         agent
@@ -576,7 +747,28 @@ impl Agent {
                         agent.handle_agent_update(data).await;
                     }
                 },
-                || info!("Connected to TaskNexus server"),
+                move |actions| {
+                    let agent = agent_sync.clone();
+                    async move {
+                        agent.handle_state_sync_result(actions).await;
+                    }
+                },
+                move |ack| {
+                    let agent = agent_ack.clone();
+                    async move {
+                        agent.handle_task_state_ack(ack).await;
+                    }
+                },
+                {
+                    let agent = agent.clone();
+                    move || {
+                        let agent = agent.clone();
+                        tokio::spawn(async move {
+                            info!("Connected to TaskNexus server");
+                            agent.send_state_sync_snapshot().await;
+                        });
+                    }
+                },
                 || warn!("Disconnected from TaskNexus server"),
             )
             .await?;
@@ -638,7 +830,7 @@ impl Agent {
         self.running_tasks
             .write()
             .await
-            .insert(task_id, (workspace_name.clone(), cancel_tx));
+            .insert(task_id, (workspace_name.clone(), cancel_tx, PathBuf::new()));
 
         // 通知任务开始
         if let Err(e) = self.client.send_task_started(task_id).await {
@@ -661,6 +853,17 @@ impl Agent {
                 return;
             }
         };
+        {
+            let log_path = log_sync_state.lock().await.local_log_path.clone();
+            if let Some((_, _, existing_log_path)) =
+                self.running_tasks.write().await.get_mut(&task_id)
+            {
+                *existing_log_path = log_path.clone();
+            }
+            let mut store = self.persisted_state.lock().await;
+            store.upsert_running(task_id, workspace_name.clone(), log_path);
+        }
+        self.save_persisted_state().await;
 
         // 启动任务心跳发送器
         let heartbeat_client = self.client.clone();
@@ -751,6 +954,41 @@ impl Agent {
             .await;
         let local_log_flush_succeeded = local_log_flush_succeeded && fully_synced;
 
+        {
+            let mut store = self.persisted_state.lock().await;
+            if result.cancelled {
+                store.remove(task_id);
+            } else if result.exit_code == 0 {
+                store.mark_completed(
+                    task_id,
+                    workspace_name.clone(),
+                    local_log_path.clone(),
+                    result.exit_code,
+                    trim_output_for_storage(result.stdout.clone()),
+                    trim_output_for_storage(result.stderr.clone()),
+                    result.result.clone(),
+                );
+            } else if result.timed_out {
+                store.mark_failed(
+                    task_id,
+                    workspace_name.clone(),
+                    local_log_path.clone(),
+                    format!("Task timed out after {} seconds", data.timeout),
+                );
+            } else {
+                store.mark_completed(
+                    task_id,
+                    workspace_name.clone(),
+                    local_log_path.clone(),
+                    result.exit_code,
+                    trim_output_for_storage(result.stdout.clone()),
+                    trim_output_for_storage(result.stderr.clone()),
+                    result.result.clone(),
+                );
+            }
+        }
+        self.save_persisted_state().await;
+
         // 发送结果
         if result.cancelled {
             info!(
@@ -805,21 +1043,25 @@ impl Agent {
             );
         }
 
-        if local_log_flush_succeeded {
-            if let Err(e) = fs::remove_file(&local_log_path) {
-                warn!(
-                    "Failed to cleanup local task log for {} at {:?}: {}",
-                    task_id, local_log_path, e
-                );
-            } else {
-                info!(
-                    "Cleaned up local task log for {} at {:?}",
-                    task_id, local_log_path
-                );
-            }
-        } else {
+        let should_cleanup_local_log = {
+            let store = self.persisted_state.lock().await;
+            store.get(task_id).is_none()
+        };
+
+        if local_log_flush_succeeded && should_cleanup_local_log {
+            self.cleanup_persisted_task_files(local_log_path.to_string_lossy().as_ref());
+            info!(
+                "Cleaned up local task log for {} at {:?}",
+                task_id, local_log_path
+            );
+        } else if !local_log_flush_succeeded {
             warn!(
                 "Keeping local task log for {} at {:?} because final log flush did not complete successfully",
+                task_id, local_log_path
+            );
+        } else {
+            info!(
+                "Keeping local task log for {} at {:?} until server ack clears persisted state",
                 task_id, local_log_path
             );
         }
@@ -832,7 +1074,7 @@ impl Agent {
     async fn handle_task_cancel(&self, task_id: i64) {
         info!("Processing cancel for task {}", task_id);
         let running = self.running_tasks.read().await;
-        if let Some((workspace_name, cancel_tx)) = running.get(&task_id) {
+        if let Some((workspace_name, cancel_tx, _)) = running.get(&task_id) {
             info!(
                 "Sending cancel signal to task {} in workspace '{}'",
                 task_id, workspace_name
@@ -901,6 +1143,12 @@ impl Agent {
                 return;
             }
         };
+        {
+            let log_path = log_sync_state.lock().await.local_log_path.clone();
+            let mut store = self.persisted_state.lock().await;
+            store.upsert_running(task_id, "[self_update]".to_string(), log_path);
+        }
+        self.save_persisted_state().await;
 
         self.append_manual_task_log_line(
             &log_sync_state,
@@ -940,6 +1188,21 @@ impl Agent {
                     );
                 }
 
+                {
+                    let local_log_path = log_sync_state.lock().await.local_log_path.clone();
+                    let mut store = self.persisted_state.lock().await;
+                    store.mark_completed(
+                        task_id,
+                        "[self_update]".to_string(),
+                        local_log_path,
+                        0,
+                        String::new(),
+                        String::new(),
+                        result.clone(),
+                    );
+                }
+                self.save_persisted_state().await;
+
                 if let Err(e) = self
                     .client
                     .send_task_completed(task_id, 0, String::new(), String::new(), result)
@@ -962,6 +1225,17 @@ impl Agent {
                     true,
                 )
                 .await;
+                {
+                    let local_log_path = log_sync_state.lock().await.local_log_path.clone();
+                    let mut store = self.persisted_state.lock().await;
+                    store.mark_failed(
+                        task_id,
+                        "[self_update]".to_string(),
+                        local_log_path,
+                        format!("Self-update failed: {}", e),
+                    );
+                }
+                self.save_persisted_state().await;
                 let _ = self
                     .client
                     .send_task_failed(task_id, format!("Self-update failed: {}", e))
@@ -1002,8 +1276,22 @@ async fn main() {
     // 根据配置自动应用开机自启动设置
     apply_autostart_from_config(&config, &config_path);
 
+    let mut persisted_state = match PersistedStateStore::load(&config.workspaces_path) {
+        Ok(store) => store,
+        Err(e) => {
+            error!("Failed to load persisted agent state: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if persisted_state.recover_after_restart() {
+        if let Err(e) = persisted_state.save() {
+            error!("Failed to save recovered persisted agent state: {}", e);
+            std::process::exit(1);
+        }
+    }
+
     // 创建并运行 Agent
-    let agent = Agent::new(config, config_path);
+    let agent = Agent::new(config, config_path, persisted_state);
 
     if let Err(e) = agent.start().await {
         error!("Agent 运行失败: {}", e);

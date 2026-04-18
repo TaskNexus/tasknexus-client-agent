@@ -4,6 +4,7 @@
 
 use crate::config::{AgentConfig, SystemInfo};
 use crate::error::{AgentError, Result};
+use crate::persisted_state::PersistedTaskState;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -40,6 +41,15 @@ pub enum ServerMessage {
     TaskLogAck {
         task_id: i64,
         next_offset: u64,
+    },
+    StateSyncResult {
+        #[serde(default)]
+        actions: Vec<StateSyncAction>,
+    },
+    TaskStateAck {
+        task_id: i64,
+        status: String,
+        accepted: bool,
     },
     TaskDispatch {
         task_id: i64,
@@ -92,6 +102,9 @@ fn default_execution_mode() -> String {
 pub enum ClientMessage {
     Heartbeat {
         system_info: SystemInfo,
+    },
+    StateSync {
+        tasks: Vec<StateSyncTask>,
     },
     TaskStarted {
         task_id: i64,
@@ -149,6 +162,91 @@ pub struct TaskDispatchData {
 #[derive(Debug, Clone)]
 pub struct AgentUpdateData {
     pub task_id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateSyncAction {
+    pub task_id: i64,
+    pub action: String,
+    #[serde(default)]
+    pub backend_status: String,
+    #[serde(default)]
+    pub payload: Option<StateSyncPayload>,
+    #[serde(default)]
+    pub server_log_offset: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StateSyncPayload {
+    TaskDispatch {
+        task_id: i64,
+        #[serde(default)]
+        workspace_name: String,
+        #[serde(default = "default_execution_mode")]
+        execution_mode: String,
+        #[serde(default)]
+        command: String,
+        #[serde(default)]
+        code: Option<InlineCode>,
+        #[serde(default)]
+        client_repo_url: Option<String>,
+        #[serde(default = "default_ref")]
+        client_repo_ref: String,
+        #[serde(default)]
+        client_repo_token: Option<String>,
+        #[serde(default = "default_timeout")]
+        timeout: u64,
+        #[serde(default)]
+        environment: HashMap<String, String>,
+        #[serde(default)]
+        prepare_repo_before_execute: bool,
+        #[serde(default)]
+        cleanup_workspace_on_success: bool,
+    },
+    AgentUpdate {
+        task_id: i64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskStateAckData {
+    pub task_id: i64,
+    pub status: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateSyncTask {
+    pub task_id: i64,
+    pub local_state: String,
+    pub workspace_name: String,
+    pub final_payload: serde_json::Value,
+    pub has_local_log: bool,
+}
+
+impl StateSyncTask {
+    pub fn from_persisted(task: &PersistedTaskState) -> Self {
+        let local_state = match task.local_state {
+            crate::persisted_state::PersistedTaskStateKind::Running => "RUNNING",
+            crate::persisted_state::PersistedTaskStateKind::CompletedPendingSync => {
+                "COMPLETED_PENDING_SYNC"
+            }
+            crate::persisted_state::PersistedTaskStateKind::FailedPendingSync => {
+                "FAILED_PENDING_SYNC"
+            }
+            crate::persisted_state::PersistedTaskStateKind::LostOnRestart => "LOST_ON_RESTART",
+        }
+        .to_string();
+
+        Self {
+            task_id: task.task_id,
+            local_state,
+            workspace_name: task.workspace_name.clone(),
+            final_payload: task.final_payload.to_state_sync_payload(),
+            has_local_log: !task.local_log_path.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -292,7 +390,7 @@ impl AgentClient {
         self.connection_generation.load(Ordering::SeqCst)
     }
 
-    async fn record_task_log_ack(&self, task_id: i64, next_offset: u64) {
+    pub async fn record_task_log_ack(&self, task_id: i64, next_offset: u64) {
         let mut ack_offsets = self.log_ack_offsets.write().await;
         ack_offsets
             .entry(task_id)
@@ -334,6 +432,11 @@ impl AgentClient {
     pub async fn send_heartbeat(&self) -> Result<()> {
         let system_info = self.config.get_system_info();
         self.send_control_message(ClientMessage::Heartbeat { system_info })
+            .await
+    }
+
+    pub async fn send_state_sync(&self, tasks: Vec<StateSyncTask>) -> Result<()> {
+        self.send_control_message(ClientMessage::StateSync { tasks })
             .await
     }
 
@@ -421,12 +524,14 @@ impl AgentClient {
     }
 
     /// 运行客户端主循环
-    pub async fn run<F, G, H, Fut1, Fut2, Fut3>(
+    pub async fn run<F, G, H, I, J, Fut1, Fut2, Fut3, Fut4, Fut5>(
         &self,
         on_task_dispatch: F,
         on_task_cancel: G,
         on_agent_update: H,
-        on_connected: impl Fn() + Send + Sync + 'static,
+        on_state_sync_result: I,
+        on_task_state_ack: J,
+        on_connected: impl Fn() + Send + Sync + Clone + 'static,
         on_disconnected: impl Fn() + Send + Sync + 'static,
     ) -> Result<()>
     where
@@ -436,6 +541,10 @@ impl AgentClient {
         Fut2: std::future::Future<Output = ()> + Send,
         H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + Clone + 'static,
         Fut3: std::future::Future<Output = ()> + Send + 'static,
+        I: Fn(Vec<StateSyncAction>) -> Fut4 + Send + Sync + Clone + 'static,
+        Fut4: std::future::Future<Output = ()> + Send + 'static,
+        J: Fn(TaskStateAckData) -> Fut5 + Send + Sync + Clone + 'static,
+        Fut5: std::future::Future<Output = ()> + Send + 'static,
     {
         *self.running.write().await = true;
 
@@ -445,7 +554,9 @@ impl AgentClient {
                     on_task_dispatch.clone(),
                     on_task_cancel.clone(),
                     on_agent_update.clone(),
-                    &on_connected,
+                    on_state_sync_result.clone(),
+                    on_task_state_ack.clone(),
+                    on_connected.clone(),
                 )
                 .await
             {
@@ -502,12 +613,14 @@ impl AgentClient {
     }
 
     /// 消息接收循环
-    async fn message_loop<F, G, H, Fut1, Fut2, Fut3>(
+    async fn message_loop<F, G, H, I, J, Fut1, Fut2, Fut3, Fut4, Fut5>(
         &self,
         on_task_dispatch: F,
         on_task_cancel: G,
         on_agent_update: H,
-        on_connected: &(dyn Fn() + Send + Sync),
+        on_state_sync_result: I,
+        on_task_state_ack: J,
+        on_connected: impl Fn() + Send + Sync + Clone + 'static,
     ) -> Result<()>
     where
         F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + Clone + 'static,
@@ -516,6 +629,10 @@ impl AgentClient {
         Fut2: std::future::Future<Output = ()> + Send,
         H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + Clone + 'static,
         Fut3: std::future::Future<Output = ()> + Send + 'static,
+        I: Fn(Vec<StateSyncAction>) -> Fut4 + Send + Sync + Clone + 'static,
+        Fut4: std::future::Future<Output = ()> + Send + 'static,
+        J: Fn(TaskStateAckData) -> Fut5 + Send + Sync + Clone + 'static,
+        Fut5: std::future::Future<Output = ()> + Send + 'static,
     {
         let url = self.ws_url()?;
         info!("Connecting to {}...", self.config.server);
@@ -527,7 +644,6 @@ impl AgentClient {
             "Established websocket connection generation {}",
             connection_generation
         );
-        on_connected();
 
         let (write, mut read) = ws_stream.split();
 
@@ -650,6 +766,9 @@ impl AgentClient {
                             on_task_dispatch.clone(),
                             on_task_cancel.clone(),
                             on_agent_update.clone(),
+                            on_state_sync_result.clone(),
+                            on_task_state_ack.clone(),
+                            on_connected.clone(),
                         )
                         .await;
                     }
@@ -683,12 +802,15 @@ impl AgentClient {
     }
 
     /// 处理接收到的消息
-    async fn handle_message<F, G, H, Fut1, Fut2, Fut3>(
+    async fn handle_message<F, G, H, I, J, Fut1, Fut2, Fut3, Fut4, Fut5>(
         &self,
         message: ServerMessage,
         on_task_dispatch: F,
         on_task_cancel: G,
         on_agent_update: H,
+        on_state_sync_result: I,
+        on_task_state_ack: J,
+        on_connected: impl Fn() + Send + Sync + 'static,
     ) where
         F: Fn(TaskDispatchData) -> Fut1 + Send + Sync + 'static,
         Fut1: std::future::Future<Output = ()> + Send + 'static,
@@ -696,10 +818,15 @@ impl AgentClient {
         Fut2: std::future::Future<Output = ()> + Send,
         H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + 'static,
         Fut3: std::future::Future<Output = ()> + Send + 'static,
+        I: Fn(Vec<StateSyncAction>) -> Fut4 + Send + Sync + 'static,
+        Fut4: std::future::Future<Output = ()> + Send + 'static,
+        J: Fn(TaskStateAckData) -> Fut5 + Send + Sync + 'static,
+        Fut5: std::future::Future<Output = ()> + Send + 'static,
     {
         match message {
             ServerMessage::Connected { message } => {
                 info!("Server acknowledged connection: {}", message);
+                on_connected();
             }
             ServerMessage::HeartbeatAck { server_time } => {
                 debug!("Heartbeat acknowledged at {}", server_time);
@@ -709,6 +836,21 @@ impl AgentClient {
                 next_offset,
             } => {
                 self.record_task_log_ack(task_id, next_offset).await;
+            }
+            ServerMessage::StateSyncResult { actions } => {
+                on_state_sync_result(actions).await;
+            }
+            ServerMessage::TaskStateAck {
+                task_id,
+                status,
+                accepted,
+            } => {
+                on_task_state_ack(TaskStateAckData {
+                    task_id,
+                    status,
+                    accepted,
+                })
+                .await;
             }
             ServerMessage::TaskDispatch {
                 task_id,

@@ -118,6 +118,20 @@ class WorkspaceAcquireService(Service):
         client_repo_ref = data.get_one_of_outputs("_client_repo_ref", "main")
         client_repo_token = data.get_one_of_outputs("_client_repo_token", "")
         pipeline_id = data.get_one_of_outputs("_pipeline_id", "")
+        dispatch_payload = {
+            "type": "task_dispatch",
+            "task_id": None,
+            "workspace_name": workspace.name,
+            "client_repo_url": client_repo_url,
+            "client_repo_ref": client_repo_ref,
+            "client_repo_token": client_repo_token,
+            "execution_mode": "command",
+            "command": "",
+            "timeout": 300,
+            "environment": agent.environment,
+            "prepare_repo_before_execute": True,
+            "cleanup_workspace_on_success": False,
+        }
 
         try:
             task = AgentTask.objects.create(
@@ -129,30 +143,20 @@ class WorkspaceAcquireService(Service):
                 command="[workspace_prepare]",
                 timeout=300,
                 status="PENDING",
+                dispatch_payload=dispatch_payload,
             )
         except Exception as exc:
             data.outputs.ex_data = f"Failed to create workspace prepare task: {exc}"
             return False
 
         data.set_outputs("_prepare_task_id", task.id)
+        dispatch_payload["task_id"] = task.id
+        AgentTask.objects.filter(id=task.id).update(dispatch_payload=dispatch_payload)
         try:
             publish_dispatch_event(
                 task_id=task.id,
                 agent_id=agent.id,
-                payload={
-                    "type": "task_dispatch",
-                    "task_id": task.id,
-                    "workspace_name": workspace.name,
-                    "client_repo_url": client_repo_url,
-                    "client_repo_ref": client_repo_ref,
-                    "client_repo_token": client_repo_token,
-                    "execution_mode": "command",
-                    "command": "",
-                    "timeout": 300,
-                    "environment": agent.environment,
-                    "prepare_repo_before_execute": True,
-                    "cleanup_workspace_on_success": False,
-                },
+                payload=dispatch_payload,
             )
             return True
         except Exception as exc:
@@ -185,6 +189,20 @@ class WorkspaceAcquireService(Service):
         client_repo_url = data.get_one_of_outputs("_client_repo_url", "")
         client_repo_ref = data.get_one_of_outputs("_client_repo_ref", "main")
         client_repo_token = data.get_one_of_outputs("_client_repo_token", "")
+        dispatch_payload = {
+            "type": "task_dispatch",
+            "task_id": None,
+            "workspace_name": workspace_name,
+            "client_repo_url": client_repo_url,
+            "client_repo_ref": client_repo_ref,
+            "client_repo_token": client_repo_token,
+            "execution_mode": "command",
+            "command": "",
+            "timeout": 300,
+            "environment": agent.environment,
+            "prepare_repo_before_execute": True,
+            "cleanup_workspace_on_success": False,
+        }
 
         try:
             task = AgentTask.objects.create(
@@ -196,30 +214,20 @@ class WorkspaceAcquireService(Service):
                 command="[sandbox_prepare]",
                 timeout=300,
                 status="PENDING",
+                dispatch_payload=dispatch_payload,
             )
         except Exception as exc:
             data.outputs.ex_data = f"Failed to create sandbox prepare task: {exc}"
             return False
 
         data.set_outputs("_prepare_task_id", task.id)
+        dispatch_payload["task_id"] = task.id
+        AgentTask.objects.filter(id=task.id).update(dispatch_payload=dispatch_payload)
         try:
             publish_dispatch_event(
                 task_id=task.id,
                 agent_id=agent.id,
-                payload={
-                    "type": "task_dispatch",
-                    "task_id": task.id,
-                    "workspace_name": workspace_name,
-                    "client_repo_url": client_repo_url,
-                    "client_repo_ref": client_repo_ref,
-                    "client_repo_token": client_repo_token,
-                    "execution_mode": "command",
-                    "command": "",
-                    "timeout": 300,
-                    "environment": agent.environment,
-                    "prepare_repo_before_execute": True,
-                    "cleanup_workspace_on_success": False,
-                },
+                payload=dispatch_payload,
             )
             return True
         except Exception as exc:
