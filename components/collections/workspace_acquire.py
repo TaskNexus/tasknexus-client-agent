@@ -168,12 +168,14 @@ class WorkspaceAcquireService(Service):
             data.outputs.ex_data = f"Failed to dispatch workspace prepare task: {exc}"
             return False
 
-    def _select_online_agent(self, requested_agent_name=""):
+    def _select_online_agent(self, requested_agent_name="", workspace_label=""):
         from client_agents.models import ClientAgent
 
         qs = ClientAgent.objects.filter(status="ONLINE")
         if requested_agent_name:
             qs = qs.filter(name=requested_agent_name)
+        if workspace_label:
+            qs = qs.filter(workspaces__labels__contains=[workspace_label]).distinct()
         return qs.order_by("name").first()
 
     def _build_sandbox_workspace_name(self, workspace_label):
@@ -439,11 +441,26 @@ class WorkspaceAcquireService(Service):
             )
             data.set_outputs("_phase", "selecting_agent")
             data.set_outputs("_resource_type", "sandbox")
-            agent = self._select_online_agent(workspace_agent_name)
+            agent = self._select_online_agent(workspace_agent_name, workspace_label)
             if not agent:
                 if workspace_agent_name:
+                    requested_online_agent = self._select_online_agent(workspace_agent_name)
+                    if not requested_online_agent:
+                        data.outputs.ex_data = (
+                            f'Requested agent "{workspace_agent_name}" is not available online for sandbox mode'
+                        )
+                    elif workspace_label:
+                        data.outputs.ex_data = (
+                            f'Requested agent "{workspace_agent_name}" does not support workspace label '
+                            f'"{workspace_label}" for sandbox mode'
+                        )
+                    else:
+                        data.outputs.ex_data = (
+                            f'Requested agent "{workspace_agent_name}" is not available for sandbox mode'
+                        )
+                elif workspace_label:
                     data.outputs.ex_data = (
-                        f'Requested agent "{workspace_agent_name}" is not available online for sandbox mode'
+                        f'No online agent available for sandbox mode with workspace label "{workspace_label}"'
                     )
                 else:
                     data.outputs.ex_data = "No online agent available for sandbox mode"
