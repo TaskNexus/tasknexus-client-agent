@@ -2,6 +2,8 @@
 
 TaskNexus 客户端代理，用于连接 TaskNexus 服务器并执行远程任务。
 
+Linux 服务器通过 `systemd` 部署时的注意事项见 [LINUX_DEPLOYMENT.md](./LINUX_DEPLOYMENT.md)。
+
 ## 特性
 
 - 🚀 **高性能** - 使用 Rust 编写，二进制文件仅 ~2.5 MB
