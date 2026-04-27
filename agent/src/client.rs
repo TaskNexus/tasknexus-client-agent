@@ -84,6 +84,11 @@ pub enum ServerMessage {
         #[serde(default)]
         download_url: Option<String>,
     },
+    FetchAgentLog {
+        request_id: String,
+        #[serde(default = "default_tail_bytes")]
+        tail_bytes: u64,
+    },
 }
 
 fn default_ref() -> String {
@@ -96,6 +101,10 @@ fn default_timeout() -> u64 {
 
 fn default_execution_mode() -> String {
     "command".to_string()
+}
+
+fn default_tail_bytes() -> u64 {
+    256 * 1024
 }
 
 /// 客户端发送的消息类型
@@ -142,6 +151,14 @@ pub enum ClientMessage {
     TaskHeartbeat {
         task_id: i64,
     },
+    AgentLogContent {
+        request_id: String,
+        content: String,
+        file_path: String,
+        total_size: u64,
+        truncated: bool,
+        error: String,
+    },
 }
 
 /// 任务分发的数据
@@ -165,6 +182,12 @@ pub struct TaskDispatchData {
 pub struct AgentUpdateData {
     pub task_id: i64,
     pub download_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchAgentLogData {
+    pub request_id: String,
+    pub tail_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -526,6 +549,27 @@ impl AgentClient {
     pub async fn send_task_heartbeat(&self, task_id: i64) -> Result<()> {
         self.send_control_message(ClientMessage::TaskHeartbeat { task_id })
             .await
+    }
+
+    /// 发送 Agent 系统日志内容
+    pub async fn send_agent_log_content(
+        &self,
+        request_id: String,
+        content: String,
+        file_path: String,
+        total_size: u64,
+        truncated: bool,
+        error: String,
+    ) -> Result<()> {
+        self.send_control_message(ClientMessage::AgentLogContent {
+            request_id,
+            content,
+            file_path,
+            total_size,
+            truncated,
+            error,
+        })
+        .await
     }
 
     /// 运行客户端主循环
@@ -905,6 +949,138 @@ impl AgentClient {
                 tokio::spawn(async move {
                     on_agent_update(data).await;
                 });
+            }
+            ServerMessage::FetchAgentLog {
+                request_id,
+                tail_bytes,
+            } => {
+                debug!(
+                    "Received fetch_agent_log request (request_id={}, tail_bytes={})",
+                    request_id, tail_bytes
+                );
+                let client = self.clone();
+                tokio::spawn(async move {
+                    client.handle_fetch_agent_log(request_id, tail_bytes).await;
+                });
+            }
+        }
+    }
+
+    /// 处理系统日志拉取请求
+    async fn handle_fetch_agent_log(&self, request_id: String, tail_bytes: u64) {
+        let log_file = match &self.config.log_file {
+            Some(path) => path.clone(),
+            None => {
+                warn!("fetch_agent_log: log_file not configured");
+                let _ = self
+                    .send_agent_log_content(
+                        request_id,
+                        String::new(),
+                        String::new(),
+                        0,
+                        false,
+                        "Agent 未配置 log_file，日志仅输出到 stdout".to_string(),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        // tracing_appender::rolling::daily 生成的文件名格式为
+        // {prefix}.{YYYY-MM-DD}，定位当天的日志文件
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let parent = log_file
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let file_stem = log_file
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("agent.log"));
+        let daily_file = parent.join(format!(
+            "{}.{}",
+            file_stem.to_string_lossy(),
+            today
+        ));
+
+        // 尝试当天的日志文件，如果不存在则尝试原始路径
+        let actual_path = if tokio::fs::try_exists(&daily_file).await.unwrap_or(false) {
+            daily_file
+        } else if tokio::fs::try_exists(&log_file).await.unwrap_or(false) {
+            log_file.clone()
+        } else {
+            warn!(
+                "fetch_agent_log: log file not found at {:?} or {:?}",
+                daily_file, log_file
+            );
+            let _ = self
+                .send_agent_log_content(
+                    request_id,
+                    String::new(),
+                    log_file.to_string_lossy().to_string(),
+                    0,
+                    false,
+                    format!("日志文件不存在: {}", log_file.display()),
+                )
+                .await;
+            return;
+        };
+
+        let file_path_str = actual_path.to_string_lossy().to_string();
+        debug!("fetch_agent_log: reading log file {:?}", actual_path);
+
+        match tokio::fs::read(&actual_path).await {
+            Ok(data) => {
+                let total_size = data.len() as u64;
+                let tail = (tail_bytes as usize).min(data.len());
+                let offset = data.len().saturating_sub(tail);
+                let truncated = offset > 0;
+                let slice = &data[offset..];
+
+                // 确保 UTF-8 安全截断：跳过不完整的首行
+                let content = String::from_utf8_lossy(slice);
+                let content = if truncated {
+                    // 跳过第一个不完整的行
+                    if let Some(pos) = content.find('\n') {
+                        content[pos + 1..].to_string()
+                    } else {
+                        content.to_string()
+                    }
+                } else {
+                    content.to_string()
+                };
+
+                debug!(
+                    "fetch_agent_log: sending {} bytes of log content (total_size={}, truncated={})",
+                    content.len(),
+                    total_size,
+                    truncated
+                );
+
+                if let Err(e) = self
+                    .send_agent_log_content(
+                        request_id,
+                        content,
+                        file_path_str,
+                        total_size,
+                        truncated,
+                        String::new(),
+                    )
+                    .await
+                {
+                    error!("Failed to send agent log content: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to read log file {:?}: {}", actual_path, e);
+                let _ = self
+                    .send_agent_log_content(
+                        request_id,
+                        String::new(),
+                        file_path_str,
+                        0,
+                        false,
+                        format!("读取日志文件失败: {}", e),
+                    )
+                    .await;
             }
         }
     }
