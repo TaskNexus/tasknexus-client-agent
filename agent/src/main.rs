@@ -15,7 +15,6 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use tasknexus_agent::{
-    autostart::AutoStartManager,
     client::{
         AgentClient, AgentUpdateData, StateSyncAction, StateSyncPayload, StateSyncTask,
         TaskDispatchData, TaskStateAckData,
@@ -24,6 +23,7 @@ use tasknexus_agent::{
     executor::TaskRunner,
     persisted_state::PersistedStateStore,
     self_update,
+    service,
 };
 
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
@@ -420,10 +420,18 @@ fn read_utf8_chunk(
 #[command(name = "tasknexus-agent")]
 #[command(about = "TaskNexus Agent - 连接到 TaskNexus 服务器执行远程任务")]
 #[command(version)]
-struct Cli {
-    /// 配置文件路径 (必须)
-    #[arg(short, long)]
-    config: PathBuf,
+enum Cli {
+    /// 运行 Agent
+    Run {
+        /// 配置文件路径
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// 系统服务管理
+    Service {
+        #[command(subcommand)]
+        action: service::ServiceAction,
+    },
 }
 
 /// 配置日志
@@ -469,7 +477,6 @@ fn setup_logging(log_level: &str, log_file: Option<&PathBuf>) {
 /// Agent 主结构
 struct Agent {
     config: AgentConfig,
-    config_path: PathBuf,
     task_runner: TaskRunner,
     client: AgentClient,
     /// Maps task_id -> (workspace_name, cancel_sender, local_log_path)
@@ -481,7 +488,6 @@ struct Agent {
 impl Agent {
     fn new(
         config: AgentConfig,
-        config_path: PathBuf,
         persisted_state: PersistedStateStore,
     ) -> Self {
         let task_runner = TaskRunner::new(config.workspaces_path.clone(), config.proxy_env());
@@ -489,7 +495,6 @@ impl Agent {
 
         Self {
             config,
-            config_path,
             task_runner,
             client,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -643,8 +648,8 @@ impl Agent {
                                 })
                                 .await;
                             }
-                            StateSyncPayload::AgentUpdate { task_id } => {
-                                self.handle_agent_update(AgentUpdateData { task_id }).await;
+                            StateSyncPayload::AgentUpdate { task_id, download_url } => {
+                                self.handle_agent_update(AgentUpdateData { task_id, download_url }).await;
                             }
                         }
                     }
@@ -1157,12 +1162,12 @@ impl Agent {
         )
         .await;
 
-        match self_update::perform_self_update(&self.config_path).await {
+        match self_update::perform_self_update(data.download_url.as_deref()).await {
             Ok(update_result) => {
                 self.append_manual_task_log_line(
                     &log_sync_state,
                     &format!(
-                        "Updater launched successfully for version {}. Agent will restart now.",
+                        "Binary replaced to version {}. Agent will restart via service manager.",
                         update_result.target_version
                     ),
                     false,
@@ -1214,8 +1219,10 @@ impl Agent {
                     );
                 }
 
+                info!("Binary replaced, exiting for service manager restart...");
                 tokio::time::sleep(Duration::from_millis(700)).await;
-                std::process::exit(0);
+                // 使用非零退出码触发服务管理器的 on-failure 自动重启
+                std::process::exit(42);
             }
             Err(e) => {
                 error!("Self-update task {} failed: {}", task_id, e);
@@ -1248,13 +1255,33 @@ impl Agent {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
-    // 加载配置
-    let config_path = cli.config.clone();
-    let config = match load_config(cli.config) {
+    match cli {
+        Cli::Run { config } => {
+            // Windows: 尝试以 SCM 服务模式运行
+            // 如果进程由 SCM 启动，service_dispatcher::start 会阻塞直到服务停止
+            // 如果由用户直接启动，会失败并回退到前台模式
+            #[cfg(windows)]
+            {
+                if try_run_as_windows_service() {
+                    return;
+                }
+            }
+
+            // 前台模式运行（用户直接启动或 Linux/macOS 服务管理器启动）
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            rt.block_on(run_agent(config));
+        }
+        Cli::Service { action } => {
+            service::handle_service_command(action);
+        }
+    }
+}
+
+pub async fn run_agent(config_path: PathBuf) {
+    let config = match load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("配置加载失败: {}", e);
@@ -1273,8 +1300,8 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // 根据配置自动应用开机自启动设置
-    apply_autostart_from_config(&config, &config_path);
+    // 清理上次更新遗留的 .bak 文件
+    self_update::cleanup_previous_update();
 
     let mut persisted_state = match PersistedStateStore::load(&config.workspaces_path) {
         Ok(store) => store,
@@ -1291,7 +1318,7 @@ async fn main() {
     }
 
     // 创建并运行 Agent
-    let agent = Agent::new(config, config_path, persisted_state);
+    let agent = Agent::new(config, persisted_state);
 
     if let Err(e) = agent.start().await {
         error!("Agent 运行失败: {}", e);
@@ -1299,36 +1326,155 @@ async fn main() {
     }
 }
 
-/// 根据配置自动应用开机自启动设置
-fn apply_autostart_from_config(config: &AgentConfig, config_path: &PathBuf) {
-    let extra_args = if config.autostart.args.is_empty() {
-        None
-    } else {
-        Some(config.autostart.args.as_slice())
+// ---------------------------------------------------------------------------
+// Windows SCM 服务入口（仅 Windows 编译）
+// ---------------------------------------------------------------------------
+
+/// 尝试注册到 Windows SCM 并以服务模式运行。
+///
+/// 如果由 SCM 启动，`service_dispatcher::start` 阻塞直到服务停止，返回 `true`。
+/// 如果由用户直接启动，返回 `false`，调用者应回退到前台模式。
+#[cfg(windows)]
+fn try_run_as_windows_service() -> bool {
+    use windows_service::service_dispatcher;
+    match service_dispatcher::start(service::SERVICE_NAME, ffi_service_main) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+windows_service::define_windows_service!(ffi_service_main, windows_service_main);
+
+/// Windows 服务主入口（由 SCM 在后台线程调用）
+#[cfg(windows)]
+fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_service::{
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult},
     };
 
-    let manager = match AutoStartManager::new("tasknexus-agent", Some(config_path), extra_args) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("创建自启动管理器失败: {}", e);
+    // 创建 channel：控制处理器通过它发送 Stop 信号
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+    // 注册服务控制处理器
+    let status_handle =
+        match service_control_handler::register(service::SERVICE_NAME, move |control_event| {
+            match control_event {
+                ServiceControl::Stop => {
+                    let _ = shutdown_tx.send(());
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        }) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Failed to register service control handler: {}", e);
+                return;
+            }
+        };
+
+    // 上报 Running 状态给 SCM
+    if let Err(e) = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    }) {
+        eprintln!("Failed to set service status to Running: {}", e);
+        return;
+    }
+
+    // 从进程命令行获取 config 路径
+    // SCM 启动命令为: tasknexus-agent.exe run --config <path>
+    let config_path = match extract_config_from_process_args() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "Service: failed to extract --config from process arguments. \
+                 Please reinstall the service with: tasknexus-agent service install --config <path>"
+            );
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            });
             return;
         }
     };
 
-    // 检查当前状态是否与配置一致
-    let current_enabled = manager.is_enabled().unwrap_or(false);
-
-    if config.autostart.enabled && !current_enabled {
-        // 配置要求启用，但当前未启用
-        match manager.enable() {
-            Ok(_) => info!("根据配置启用了开机自启动"),
-            Err(e) => warn!("启用开机自启动失败: {}", e),
+    // 创建 tokio runtime 运行 Agent
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create tokio runtime: {}", e);
+            return;
         }
-    } else if !config.autostart.enabled && current_enabled {
-        // 配置要求禁用，但当前已启用
-        match manager.disable() {
-            Ok(_) => info!("根据配置禁用了开机自启动"),
-            Err(e) => warn!("禁用开机自启动失败: {}", e),
+    };
+
+    rt.block_on(async {
+        // 启动 Agent
+        let agent_handle = tokio::spawn(run_agent(config_path));
+        tokio::pin!(agent_handle);
+
+        // 在后台等待 SCM Stop 信号
+        let stop_waiter = tokio::task::spawn_blocking(move || {
+            let _ = shutdown_rx.recv();
+        });
+        tokio::pin!(stop_waiter);
+
+        // 等待 Stop 信号或 Agent 自行退出（以先发生者为准）
+        tokio::select! {
+            _ = &mut stop_waiter => {
+                // 收到 Stop 信号，中止 Agent
+                agent_handle.abort();
+            }
+            _ = &mut agent_handle => {
+                // Agent 自行退出（例如自更新场景的 exit(42)）
+            }
+        }
+    });
+
+    // 上报 Stopped 状态
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    });
+}
+
+/// 从当前进程命令行参数中提取 --config 值
+#[cfg(windows)]
+fn extract_config_from_process_args() -> Option<PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--config" || arg == "-c" {
+            if let Some(value) = iter.next() {
+                return Some(PathBuf::from(value));
+            }
+        }
+        if let Some(value) = arg.strip_prefix("--config=") {
+            return Some(PathBuf::from(value));
         }
     }
+    None
 }

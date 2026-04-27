@@ -270,13 +270,37 @@ impl StdoutCapture {
     }
 }
 
+/// 将字节缓冲区解码为 String。
+///
+/// 优先按 UTF-8 解码；如果 UTF-8 无效且在 Windows 上，按 GBK 解码。
+/// 这是因为 Windows 服务模式下 `chcp 65001` 无效，cmd.exe 输出仍然使用 GBK。
+fn decode_bytes(bytes: &[u8]) -> String {
+    // 先尝试 UTF-8
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+
+    // Windows 上回退到 GBK
+    #[cfg(windows)]
+    {
+        let (cow, _, _) = encoding_rs::GBK.decode(bytes);
+        return cow.into_owned();
+    }
+
+    // 非 Windows 上使用 lossy UTF-8
+    #[cfg(not(windows))]
+    {
+        String::from_utf8_lossy(bytes).to_string()
+    }
+}
+
 fn split_stream_chunks(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<String> {
     let mut result = Vec::new();
 
     for byte in incoming {
         pending.push(*byte);
         if *byte == b'\n' || *byte == b'\r' {
-            result.push(String::from_utf8_lossy(pending).to_string());
+            result.push(decode_bytes(pending));
             pending.clear();
         }
     }
@@ -288,7 +312,7 @@ fn flush_stream_buffer(pending: &mut Vec<u8>) -> Option<String> {
     if pending.is_empty() {
         return None;
     }
-    let text = String::from_utf8_lossy(pending).to_string();
+    let text = decode_bytes(pending);
     pending.clear();
     Some(text)
 }

@@ -2,13 +2,13 @@
 //!
 //! 提供客户端代理的核心功能模块。
 
-pub mod autostart;
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod executor;
 pub mod persisted_state;
 pub mod self_update;
+pub mod service;
 
 pub use client::AgentClient;
 pub use config::AgentConfig;

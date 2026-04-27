@@ -81,6 +81,8 @@ pub enum ServerMessage {
     },
     AgentUpdate {
         task_id: i64,
+        #[serde(default)]
+        download_url: Option<String>,
     },
 }
 
@@ -162,6 +164,7 @@ pub struct TaskDispatchData {
 #[derive(Debug, Clone)]
 pub struct AgentUpdateData {
     pub task_id: i64,
+    pub download_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +209,8 @@ pub enum StateSyncPayload {
     },
     AgentUpdate {
         task_id: i64,
+        #[serde(default)]
+        download_url: Option<String>,
     },
 }
 
@@ -894,9 +899,9 @@ impl AgentClient {
                 info!("Received task cancel: {}", task_id);
                 on_task_cancel(task_id).await;
             }
-            ServerMessage::AgentUpdate { task_id } => {
+            ServerMessage::AgentUpdate { task_id, download_url } => {
                 info!("Received self-update task {}", task_id);
-                let data = AgentUpdateData { task_id };
+                let data = AgentUpdateData { task_id, download_url };
                 tokio::spawn(async move {
                     on_agent_update(data).await;
                 });

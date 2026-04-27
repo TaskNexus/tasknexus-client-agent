@@ -30,7 +30,9 @@ task_timeout: 3600
 # https_proxy: http://127.0.0.1:7890
 # no_proxy: localhost,127.0.0.1,.internal.example.com
 
-# 开机自启动配置
-autostart:
-  enabled: false  # 是否启用开机自启动
-  args: []        # 启动时的额外命令行参数，例如: ["--log-level", "DEBUG"]
+# 服务部署:
+#   安装: tasknexus-agent service install --config /abs/path/to/config.yaml
+#   卸载: tasknexus-agent service uninstall
+#   状态: tasknexus-agent service status
+#   启动: tasknexus-agent service start
+#   停止: tasknexus-agent service stop

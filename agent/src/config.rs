@@ -49,19 +49,6 @@ pub struct AgentConfig {
     /// 不走代理的地址列表
     pub no_proxy: Option<String>,
 
-    /// 开机自启动配置
-    pub autostart: AutostartConfig,
-}
-
-/// 开机自启动配置
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct AutostartConfig {
-    /// 是否启用开机自启动
-    pub enabled: bool,
-
-    /// 启动时的额外参数
-    pub args: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -81,7 +68,6 @@ impl Default for AgentConfig {
             http_proxy: None,
             https_proxy: None,
             no_proxy: None,
-            autostart: AutostartConfig::default(),
         }
     }
 }

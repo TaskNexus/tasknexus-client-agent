@@ -87,7 +87,35 @@ sudo -u tasknexus python3 -m venv /venv
 
 ## systemd 配置方式
 
-如果服务已经存在，优先使用 `systemd` 的 drop-in 覆盖配置，而不是直接改原始
+### 推荐：使用内置命令安装服务
+
+Agent 内置了 systemd 服务安装功能，可以自动生成 unit 文件并启用服务：
+
+```bash
+# 安装为系统服务（需要 root 权限）
+sudo tasknexus-agent service install --config /var/local/tasknexus/config.yaml
+
+# 启动服务
+sudo tasknexus-agent service start
+
+# 查看服务状态
+tasknexus-agent service status
+
+# 停止 / 卸载
+sudo tasknexus-agent service stop
+sudo tasknexus-agent service uninstall
+```
+
+安装命令会自动：
+- 生成 `/etc/systemd/system/tasknexus-agent.service` unit 文件
+- 检测 Agent 目录下的 `.venv` 并自动注入 `VIRTUAL_ENV` 和 `PATH` 环境变量
+- 执行 `systemctl daemon-reload` 和 `systemctl enable`
+
+如需指定运行用户，安装后编辑 unit 文件在 `[Service]` 下添加 `User=<username>` 行，然后执行 `sudo systemctl daemon-reload && sudo systemctl restart tasknexus-agent.service`。
+
+### 手动配置（高级）
+
+如果服务已经存在，可以使用 `systemd` 的 drop-in 覆盖配置，而不是直接改原始
 unit 文件。
 
 先确认服务的准确名称：

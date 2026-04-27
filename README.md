@@ -11,7 +11,8 @@ Linux 服务器通过 `systemd` 部署时的注意事项见 [LINUX_DEPLOYMENT.md
 - ❤️ **心跳检测** - 定期发送心跳保持连接
 - 📁 **Git 支持** - 自动 clone/pull 项目仓库
 - 🖥️ **跨平台** - 支持 Windows, Linux, macOS
-- 🚀 **开机自启动** - 支持开机自动启动 Agent
+- ⚙️ **系统服务** - 支持以系统服务方式部署，开机自动启动、崩溃自动重启
+- 🔄 **自更新** - 内建自更新功能，无需额外组件
 
 ## 安装
 
@@ -28,11 +29,43 @@ cargo build --release
 
 ## 使用方法
 
-### 启动 Agent
+### 直接运行
 
 ```bash
-tasknexus-agent --config config.yaml
+tasknexus-agent run --config config.yaml
 ```
+
+### 服务部署（推荐）
+
+将 Agent 安装为系统服务，实现开机自动启动和崩溃自动恢复：
+
+```bash
+# 安装为系统服务（需要管理员/root 权限）
+tasknexus-agent service install --config /absolute/path/to/config.yaml
+
+# 启动服务
+tasknexus-agent service start
+
+# 查看服务状态
+tasknexus-agent service status
+
+# 停止服务
+tasknexus-agent service stop
+
+# 重启服务（修改系统环境变量后需要重启才能生效）
+tasknexus-agent service restart
+
+# 卸载服务
+tasknexus-agent service uninstall
+```
+
+**平台说明:**
+
+- **Windows**: 注册为 Windows Service（服务名: `tasknexus`），通过 SCM 管理，故障自动重启
+- **Linux**: 生成 `systemd` unit 文件（`/etc/systemd/system/tasknexus-agent.service`），支持 `systemctl` 管理
+- **macOS**: 生成 `launchd` plist 文件（`/Library/LaunchDaemons/com.tasknexus.agent.plist`），开机自动加载
+
+> **注意:** 安装服务时 `--config` 参数必须使用**绝对路径**。
 
 ### 配置文件
 
@@ -55,31 +88,11 @@ reconnect_interval: 5
 # http_proxy: http://127.0.0.1:7890
 # https_proxy: http://127.0.0.1:7890
 # no_proxy: localhost,127.0.0.1,.internal.example.com
-
-# 开机自启动
-autostart:
-  enabled: true
-  args: []
 ```
 
 所有配置均通过配置文件管理，不支持命令行参数覆盖。
 
 配置了 `http_proxy` / `https_proxy` / `no_proxy` 后，Agent 会在执行任务命令以及 `git clone` / `git fetch` 时自动注入 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 以及对应的小写环境变量。
-
-### 开机自启动
-
-Agent 运行时会根据配置文件自动应用开机自启动设置：
-
-```yaml
-autostart:
-  enabled: true  # 是否启用开机自启动
-  args: []       # 启动时的额外参数
-```
-
-**平台说明:**
-- **Windows**: 添加到注册表 `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
-- **Linux**: 创建 XDG Autostart `.desktop` 文件
-- **macOS**: 创建 Launch Agent `.plist` 文件
 
 ## 开发
 
@@ -88,7 +101,7 @@ autostart:
 cargo test
 
 # 开发模式运行
-cargo run -- -s ws://localhost:8001/ws/agent/ -n dev-agent
+cargo run -- run --config config.yaml
 ```
 
 ## License

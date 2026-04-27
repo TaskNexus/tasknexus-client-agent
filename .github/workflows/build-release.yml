@@ -24,26 +24,18 @@ jobs:
             target: x86_64-pc-windows-msvc
             agent_artifact_name: tasknexus-agent.exe
             agent_asset_name: tasknexus-agent-windows-x86_64.exe
-            updater_artifact_name: tasknexus-updater.exe
-            updater_asset_name: tasknexus-updater-windows-x86_64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             agent_artifact_name: tasknexus-agent
             agent_asset_name: tasknexus-agent-linux-amd64
-            updater_artifact_name: tasknexus-updater
-            updater_asset_name: tasknexus-updater-linux-amd64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             agent_artifact_name: tasknexus-agent
             agent_asset_name: tasknexus-agent-linux-arm64
-            updater_artifact_name: tasknexus-updater
-            updater_asset_name: tasknexus-updater-linux-arm64
           - os: macos-latest
             target: aarch64-apple-darwin
             agent_artifact_name: tasknexus-agent
             agent_asset_name: tasknexus-agent-macos-arm64
-            updater_artifact_name: tasknexus-updater
-            updater_asset_name: tasknexus-updater-macos-arm64
 
     runs-on: ${{ matrix.os }}
     env:
@@ -70,7 +62,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('agent/Cargo.lock', 'updater/Cargo.lock', 'agent/Cargo.toml', 'updater/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
             ${{ runner.os }}-cargo-
@@ -80,8 +72,7 @@ jobs:
         with:
           path: |
             agent/target
-            updater/target
-          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('agent/Cargo.lock', 'updater/Cargo.lock', 'agent/Cargo.toml', 'updater/Cargo.toml') }}
+          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('agent/Cargo.lock', 'agent/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-target-${{ matrix.target }}-
             ${{ runner.os }}-target-
@@ -96,10 +87,6 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         working-directory: agent
 
-      - name: Build updater executable
-        run: cargo build --release --target ${{ matrix.target }}
-        working-directory: updater
-
       - name: Sign binaries (Windows, optional)
         if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_CERT_BASE64 != ''
         shell: pwsh
@@ -112,7 +99,6 @@ jobs:
           }
 
           & signtool sign /f $certPath /p $env:WINDOWS_CODESIGN_CERT_PASSWORD /fd SHA256 /tr $timestampUrl /td SHA256 "agent/target/${{ matrix.target }}/release/${{ matrix.agent_artifact_name }}"
-          & signtool sign /f $certPath /p $env:WINDOWS_CODESIGN_CERT_PASSWORD /fd SHA256 /tr $timestampUrl /td SHA256 "updater/target/${{ matrix.target }}/release/${{ matrix.updater_artifact_name }}"
 
       - name: Sign binaries (macOS, optional)
         if: runner.os == 'macOS' && env.MACOS_CODESIGN_CERT_BASE64 != '' && env.MACOS_CODESIGN_IDENTITY != ''
@@ -131,7 +117,6 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --options runtime --timestamp "agent/target/${{ matrix.target }}/release/${{ matrix.agent_artifact_name }}"
-          codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --options runtime --timestamp "updater/target/${{ matrix.target }}/release/${{ matrix.updater_artifact_name }}"
 
       - name: Create dist directory
         run: mkdir -p dist
@@ -140,14 +125,12 @@ jobs:
       - name: Copy artifacts
         run: |
           cp "agent/target/${{ matrix.target }}/release/${{ matrix.agent_artifact_name }}" "dist/${{ matrix.agent_asset_name }}"
-          cp "updater/target/${{ matrix.target }}/release/${{ matrix.updater_artifact_name }}" "dist/${{ matrix.updater_asset_name }}"
         shell: bash
 
       - name: Verify build
         run: |
           if [[ "${{ matrix.target }}" != "aarch64"* ]]; then
             ./dist/${{ matrix.agent_asset_name }} --help
-            ./dist/${{ matrix.updater_asset_name }} --help
           fi
         shell: bash
 
@@ -157,7 +140,6 @@ jobs:
           name: ${{ matrix.agent_asset_name }}
           path: |
             dist/${{ matrix.agent_asset_name }}
-            dist/${{ matrix.updater_asset_name }}
           retention-days: 30
 
       - name: Upload config example (once)
