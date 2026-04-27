@@ -18,15 +18,15 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
-use super::{SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME};
+use super::{display_name_for, SERVICE_DESCRIPTION};
 
 type BoxError = Box<dyn std::error::Error>;
 
 /// 安装 Windows 服务
-pub fn install_service(config_path: &Path) -> Result<(), BoxError> {
+pub fn install_service(service_name: &str, config_path: &Path) -> Result<(), BoxError> {
     #[cfg(not(windows))]
     {
-        let _ = config_path;
+        let _ = (service_name, config_path);
         Err("install_service is only supported on Windows".into())
     }
 
@@ -37,10 +37,11 @@ pub fn install_service(config_path: &Path) -> Result<(), BoxError> {
 
         let current_exe = std::env::current_exe()?;
         let config_str = config_path.to_string_lossy().to_string();
+        let display_name = display_name_for(service_name);
 
         let service_info = ServiceInfo {
-            name: OsString::from(SERVICE_NAME),
-            display_name: OsString::from(SERVICE_DISPLAY_NAME),
+            name: OsString::from(service_name),
+            display_name: OsString::from(&display_name),
             service_type: ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
@@ -49,6 +50,8 @@ pub fn install_service(config_path: &Path) -> Result<(), BoxError> {
                 OsString::from("run"),
                 OsString::from("--config"),
                 OsString::from(&config_str),
+                OsString::from("--service-name"),
+                OsString::from(service_name),
             ],
             dependencies: vec![],
             account_name: None,
@@ -91,34 +94,43 @@ pub fn install_service(config_path: &Path) -> Result<(), BoxError> {
         // 允许非崩溃退出码也触发恢复操作（用于自更新场景）
         service.set_failure_actions_on_non_crash_failures(true)?;
 
-        println!("服务 '{}' 安装成功", SERVICE_DISPLAY_NAME);
-        println!("  服务名: {}", SERVICE_NAME);
+        let name_arg = if service_name == super::DEFAULT_SERVICE_NAME {
+            String::new()
+        } else {
+            format!(" --name {}", service_name)
+        };
+
+        println!("服务 '{}' 安装成功", display_name);
+        println!("  服务名: {}", service_name);
         println!("  配置文件: {}", config_str);
         println!("  启动类型: 自动");
         println!();
         println!("使用以下命令管理服务:");
-        println!("  启动: tasknexus-agent service start");
-        println!("  停止: tasknexus-agent service stop");
-        println!("  状态: tasknexus-agent service status");
-        println!("  卸载: tasknexus-agent service uninstall");
+        println!("  启动: tasknexus-agent service start{}", name_arg);
+        println!("  停止: tasknexus-agent service stop{}", name_arg);
+        println!("  重启: tasknexus-agent service restart{}", name_arg);
+        println!("  状态: tasknexus-agent service status{}", name_arg);
+        println!("  卸载: tasknexus-agent service uninstall{}", name_arg);
 
         Ok(())
     }
 }
 
 /// 卸载 Windows 服务
-pub fn uninstall_service() -> Result<(), BoxError> {
+pub fn uninstall_service(service_name: &str) -> Result<(), BoxError> {
     #[cfg(not(windows))]
     {
+        let _ = service_name;
         Err("uninstall_service is only supported on Windows".into())
     }
 
     #[cfg(windows)]
     {
+        let display_name = display_name_for(service_name);
         let manager =
             ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service = manager.open_service(
-            SERVICE_NAME,
+            service_name,
             ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
         )?;
 
@@ -144,31 +156,33 @@ pub fn uninstall_service() -> Result<(), BoxError> {
         }
 
         service.delete()?;
-        println!("服务 '{}' 已卸载", SERVICE_DISPLAY_NAME);
+        println!("服务 '{}' 已卸载", display_name);
         Ok(())
     }
 }
 
 /// 启动服务
-pub fn start_service() -> Result<(), BoxError> {
+pub fn start_service(service_name: &str) -> Result<(), BoxError> {
     #[cfg(not(windows))]
     {
+        let _ = service_name;
         Err("start_service is only supported on Windows".into())
     }
 
     #[cfg(windows)]
     {
+        let display_name = display_name_for(service_name);
         let manager =
             ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service = manager.open_service(
-            SERVICE_NAME,
+            service_name,
             ServiceAccess::START | ServiceAccess::QUERY_STATUS,
         )?;
 
         // 检查当前状态
         let status = service.query_status()?;
         if status.current_state == ServiceState::Running {
-            println!("服务 '{}' 已经在运行中", SERVICE_DISPLAY_NAME);
+            println!("服务 '{}' 已经在运行中", display_name);
             return Ok(());
         }
 
@@ -181,20 +195,20 @@ pub fn start_service() -> Result<(), BoxError> {
             let status = service.query_status()?;
             match status.current_state {
                 ServiceState::Running => {
-                    println!("服务 '{}' 已启动", SERVICE_DISPLAY_NAME);
+                    println!("服务 '{}' 已启动", display_name);
                     return Ok(());
                 }
                 ServiceState::Stopped => {
                     return Err(format!(
                         "服务 '{}' 启动后立即停止，请检查配置和日志",
-                        SERVICE_DISPLAY_NAME
+                        display_name
                     )
                     .into());
                 }
                 _ => {
                     if std::time::Instant::now() >= deadline {
                         return Err(
-                            format!("等待服务 '{}' 启动超时", SERVICE_DISPLAY_NAME).into()
+                            format!("等待服务 '{}' 启动超时", display_name).into()
                         );
                     }
                 }
@@ -204,24 +218,26 @@ pub fn start_service() -> Result<(), BoxError> {
 }
 
 /// 停止服务
-pub fn stop_service() -> Result<(), BoxError> {
+pub fn stop_service(service_name: &str) -> Result<(), BoxError> {
     #[cfg(not(windows))]
     {
+        let _ = service_name;
         Err("stop_service is only supported on Windows".into())
     }
 
     #[cfg(windows)]
     {
+        let display_name = display_name_for(service_name);
         let manager =
             ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service = manager.open_service(
-            SERVICE_NAME,
+            service_name,
             ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
         )?;
 
         let status = service.query_status()?;
         if status.current_state == ServiceState::Stopped {
-            println!("服务 '{}' 已经处于停止状态", SERVICE_DISPLAY_NAME);
+            println!("服务 '{}' 已经处于停止状态", display_name);
             return Ok(());
         }
 
@@ -233,7 +249,7 @@ pub fn stop_service() -> Result<(), BoxError> {
             std::thread::sleep(Duration::from_millis(500));
             let status = service.query_status()?;
             if status.current_state == ServiceState::Stopped {
-                println!("服务 '{}' 已停止", SERVICE_DISPLAY_NAME);
+                println!("服务 '{}' 已停止", display_name);
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -245,17 +261,19 @@ pub fn stop_service() -> Result<(), BoxError> {
 }
 
 /// 查询服务状态
-pub fn query_service_status() -> Result<(), BoxError> {
+pub fn query_service_status(service_name: &str) -> Result<(), BoxError> {
     #[cfg(not(windows))]
     {
+        let _ = service_name;
         Err("query_service_status is only supported on Windows".into())
     }
 
     #[cfg(windows)]
     {
+        let display_name = display_name_for(service_name);
         let manager =
             ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-        let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)?;
+        let service = manager.open_service(service_name, ServiceAccess::QUERY_STATUS)?;
         let status = service.query_status()?;
 
         let state_str = match status.current_state {
@@ -268,7 +286,7 @@ pub fn query_service_status() -> Result<(), BoxError> {
             ServiceState::Paused => "已暂停",
         };
 
-        println!("服务: {}", SERVICE_DISPLAY_NAME);
+        println!("服务: {} ({})", display_name, service_name);
         println!("状态: {}", state_str);
         if let Some(pid) = status.process_id {
             println!("PID:  {}", pid);

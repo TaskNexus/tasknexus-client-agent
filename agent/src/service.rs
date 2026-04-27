@@ -2,6 +2,9 @@
 //!
 //! 提供 install / uninstall / start / stop / restart / status 统一接口，
 //! 内部根据编译目标平台分发到各自实现。
+//!
+//! 支持多实例：通过 `--name` 参数可以安装多个独立的服务实例，
+//! 每个实例指向不同的配置文件（例如不同磁盘的工作空间）。
 
 #[cfg(target_os = "windows")]
 #[path = "service_windows.rs"]
@@ -18,8 +21,8 @@ mod platform;
 use clap::Subcommand;
 use std::path::PathBuf;
 
-/// 服务名称常量
-pub const SERVICE_NAME: &str = "tasknexus";
+/// 默认服务名称常量
+pub const DEFAULT_SERVICE_NAME: &str = "tasknexus";
 pub const SERVICE_DISPLAY_NAME: &str = "TaskNexus Agent";
 pub const SERVICE_DESCRIPTION: &str =
     "TaskNexus client agent - connects to TaskNexus server and executes remote tasks";
@@ -32,17 +35,52 @@ pub enum ServiceAction {
         /// 配置文件路径（必须为绝对路径）
         #[arg(short, long)]
         config: PathBuf,
+        /// 服务名称（多实例时需不同，默认: tasknexus）
+        #[arg(short, long, default_value = DEFAULT_SERVICE_NAME)]
+        name: String,
     },
     /// 卸载系统服务
-    Uninstall,
+    Uninstall {
+        /// 服务名称
+        #[arg(short, long, default_value = DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
     /// 启动服务
-    Start,
+    Start {
+        /// 服务名称
+        #[arg(short, long, default_value = DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
     /// 停止服务
-    Stop,
+    Stop {
+        /// 服务名称
+        #[arg(short, long, default_value = DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
     /// 重启服务
-    Restart,
+    Restart {
+        /// 服务名称
+        #[arg(short, long, default_value = DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
     /// 查看服务状态
-    Status,
+    Status {
+        /// 服务名称
+        #[arg(short, long, default_value = DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
+}
+
+/// 根据服务名称生成显示名称。
+///
+/// 默认实例: "TaskNexus Agent"
+/// 自定义实例: "TaskNexus Agent (custom-name)"
+pub fn display_name_for(service_name: &str) -> String {
+    if service_name == DEFAULT_SERVICE_NAME {
+        SERVICE_DISPLAY_NAME.to_string()
+    } else {
+        format!("{} ({})", SERVICE_DISPLAY_NAME, service_name)
+    }
 }
 
 /// 处理服务管理子命令（由 main.rs 调用）
@@ -50,7 +88,7 @@ pub enum ServiceAction {
 /// 此函数不返回 —— 执行成功后 exit(0)，失败后 exit(1)。
 pub fn handle_service_command(action: ServiceAction) {
     let result = match action {
-        ServiceAction::Install { config } => {
+        ServiceAction::Install { config, name } => {
             let config_path = match std::fs::canonicalize(&config) {
                 Ok(p) => p,
                 Err(e) => {
@@ -62,13 +100,15 @@ pub fn handle_service_command(action: ServiceAction) {
                 eprintln!("配置文件不存在: {:?}", config_path);
                 std::process::exit(1);
             }
-            platform::install_service(&config_path)
+            platform::install_service(&name, &config_path)
         }
-        ServiceAction::Uninstall => platform::uninstall_service(),
-        ServiceAction::Start => platform::start_service(),
-        ServiceAction::Stop => platform::stop_service(),
-        ServiceAction::Restart => platform::stop_service().and_then(|_| platform::start_service()),
-        ServiceAction::Status => platform::query_service_status(),
+        ServiceAction::Uninstall { name } => platform::uninstall_service(&name),
+        ServiceAction::Start { name } => platform::start_service(&name),
+        ServiceAction::Stop { name } => platform::stop_service(&name),
+        ServiceAction::Restart { name } => {
+            platform::stop_service(&name).and_then(|_| platform::start_service(&name))
+        }
+        ServiceAction::Status { name } => platform::query_service_status(&name),
     };
 
     match result {

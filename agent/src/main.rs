@@ -426,6 +426,9 @@ enum Cli {
         /// 配置文件路径
         #[arg(short, long)]
         config: PathBuf,
+        /// 服务名称（由 service install 自动设置，请勿手动指定）
+        #[arg(long, hide = true, default_value = service::DEFAULT_SERVICE_NAME)]
+        service_name: String,
     },
     /// 系统服务管理
     Service {
@@ -435,7 +438,10 @@ enum Cli {
 }
 
 /// 配置日志
-fn setup_logging(log_level: &str, log_file: Option<&PathBuf>) {
+///
+/// 返回的 `WorkerGuard` 必须在程序生命周期内保持存活，
+/// 否则 non-blocking writer 会被 drop，文件日志停止写入。
+fn setup_logging(log_level: &str, log_file: Option<&PathBuf>) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let level = match log_level.to_uppercase().as_str() {
         "TRACE" => Level::TRACE,
         "DEBUG" => Level::DEBUG,
@@ -467,10 +473,12 @@ fn setup_logging(log_level: &str, log_file: Option<&PathBuf>) {
                 .file_name()
                 .unwrap_or(std::ffi::OsStr::new("agent.log")),
         );
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         subscriber.with_writer(non_blocking).init();
+        Some(guard)
     } else {
         subscriber.init();
+        None
     }
 }
 
@@ -1259,18 +1267,19 @@ fn main() {
     let cli = Cli::parse();
 
     match cli {
-        Cli::Run { config } => {
+        Cli::Run { config, service_name } => {
             // Windows: 尝试以 SCM 服务模式运行
             // 如果进程由 SCM 启动，service_dispatcher::start 会阻塞直到服务停止
             // 如果由用户直接启动，会失败并回退到前台模式
             #[cfg(windows)]
             {
-                if try_run_as_windows_service() {
+                if try_run_as_windows_service(&service_name) {
                     return;
                 }
             }
 
             // 前台模式运行（用户直接启动或 Linux/macOS 服务管理器启动）
+            let _ = service_name; // Linux/macOS 不需要此参数
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(run_agent(config));
         }
@@ -1289,8 +1298,8 @@ pub async fn run_agent(config_path: PathBuf) {
         }
     };
 
-    // 配置日志
-    setup_logging(&config.log_level, config.log_file.as_ref());
+    // 配置日志（_log_guard 必须保持存活，否则文件日志停止写入）
+    let _log_guard = setup_logging(&config.log_level, config.log_file.as_ref());
 
     // 验证配置
     if let Err(errors) = config.validate() {
@@ -1335,9 +1344,9 @@ pub async fn run_agent(config_path: PathBuf) {
 /// 如果由 SCM 启动，`service_dispatcher::start` 阻塞直到服务停止，返回 `true`。
 /// 如果由用户直接启动，返回 `false`，调用者应回退到前台模式。
 #[cfg(windows)]
-fn try_run_as_windows_service() -> bool {
+fn try_run_as_windows_service(service_name: &str) -> bool {
     use windows_service::service_dispatcher;
-    match service_dispatcher::start(service::SERVICE_NAME, ffi_service_main) {
+    match service_dispatcher::start(service_name, ffi_service_main) {
         Ok(_) => true,
         Err(_) => false,
     }
@@ -1362,9 +1371,13 @@ fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
     // 创建 channel：控制处理器通过它发送 Stop 信号
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
+    // 从进程命令行参数中获取服务名称（多实例支持）
+    let service_name = extract_service_name_from_process_args()
+        .unwrap_or_else(|| service::DEFAULT_SERVICE_NAME.to_string());
+
     // 注册服务控制处理器
     let status_handle =
-        match service_control_handler::register(service::SERVICE_NAME, move |control_event| {
+        match service_control_handler::register(&service_name, move |control_event| {
             match control_event {
                 ServiceControl::Stop => {
                     let _ = shutdown_tx.send(());
@@ -1464,16 +1477,30 @@ fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
 /// 从当前进程命令行参数中提取 --config 值
 #[cfg(windows)]
 fn extract_config_from_process_args() -> Option<PathBuf> {
+    extract_arg_value("--config", Some("-c"))
+        .map(PathBuf::from)
+}
+
+/// 从当前进程命令行参数中提取 --service-name 值
+#[cfg(windows)]
+fn extract_service_name_from_process_args() -> Option<String> {
+    extract_arg_value("--service-name", None)
+}
+
+/// 通用参数提取器：支持 `--key value` 和 `--key=value` 格式
+#[cfg(windows)]
+fn extract_arg_value(long_name: &str, short_name: Option<&str>) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--config" || arg == "-c" {
+        if arg == long_name || short_name.map_or(false, |s| arg == s) {
             if let Some(value) = iter.next() {
-                return Some(PathBuf::from(value));
+                return Some(value.clone());
             }
         }
-        if let Some(value) = arg.strip_prefix("--config=") {
-            return Some(PathBuf::from(value));
+        let prefix = format!("{}=", long_name);
+        if let Some(value) = arg.strip_prefix(&prefix) {
+            return Some(value.to_string());
         }
     }
     None
