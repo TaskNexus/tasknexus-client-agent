@@ -16,8 +16,8 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use tasknexus_agent::{
     client::{
-        AgentClient, AgentUpdateData, StateSyncAction, StateSyncPayload, StateSyncTask,
-        TaskDispatchData, TaskStateAckData,
+        AgentClient, AgentRestartData, AgentUpdateData, StateSyncAction, StateSyncPayload,
+        StateSyncTask, TaskDispatchData, TaskStateAckData,
     },
     config::{load_config, AgentConfig},
     executor::TaskRunner,
@@ -659,6 +659,9 @@ impl Agent {
                             StateSyncPayload::AgentUpdate { task_id, download_url } => {
                                 self.handle_agent_update(AgentUpdateData { task_id, download_url }).await;
                             }
+                            StateSyncPayload::AgentRestart { task_id } => {
+                                self.handle_agent_restart(AgentRestartData { task_id }).await;
+                            }
                         }
                     }
                 }
@@ -735,6 +738,7 @@ impl Agent {
         let agent_clone = agent.clone();
         let agent_cancel = agent.clone();
         let agent_update = agent.clone();
+        let agent_restart = agent.clone();
         let agent_sync = agent.clone();
         let agent_ack = agent.clone();
 
@@ -758,6 +762,12 @@ impl Agent {
                     let agent = agent_update.clone();
                     async move {
                         agent.handle_agent_update(data).await;
+                    }
+                },
+                move |data| {
+                    let agent = agent_restart.clone();
+                    async move {
+                        agent.handle_agent_restart(data).await;
                     }
                 },
                 move |actions| {
@@ -1260,6 +1270,91 @@ impl Agent {
 
         self.client.clear_task_log_ack(task_id).await;
         *self.update_in_progress.write().await = false;
+    }
+
+    async fn handle_agent_restart(&self, data: AgentRestartData) {
+        let task_id = data.task_id;
+
+        let running_count = self.running_tasks.read().await.len();
+        if running_count > 0 {
+            warn!(
+                "Reject restart task {} because {} task(s) are still running",
+                task_id, running_count
+            );
+            let _ = self
+                .client
+                .send_task_failed(
+                    task_id,
+                    format!(
+                        "Cannot restart while {} task(s) are still running",
+                        running_count
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        if let Err(e) = self.client.send_task_started(task_id).await {
+            error!("Failed to report restart start for task {}: {}", task_id, e);
+        }
+
+        self.client.clear_task_log_ack(task_id).await;
+        let log_sync_state = match TaskLogSyncState::new(&self.config.workspaces_path, task_id) {
+            Ok(state) => Arc::new(Mutex::new(state)),
+            Err(e) => {
+                error!(
+                    "Failed to initialize restart log state for {}: {}",
+                    task_id, e
+                );
+                let _ = self
+                    .client
+                    .send_task_failed(task_id, format!("Failed to initialize task logs: {}", e))
+                    .await;
+                return;
+            }
+        };
+
+        self.append_manual_task_log_line(
+            &log_sync_state,
+            "Agent restart requested, exiting for service manager restart...",
+            false,
+        )
+        .await;
+
+        let fully_synced = self
+            .flush_task_logs_until_synced(
+                &log_sync_state,
+                Duration::from_millis(LOG_FINAL_SYNC_TIMEOUT_MS),
+            )
+            .await;
+        if !fully_synced {
+            warn!(
+                "Restart task {} log sync did not fully complete before exit",
+                task_id
+            );
+        }
+
+        if let Err(e) = self
+            .client
+            .send_task_completed(
+                task_id,
+                0,
+                String::new(),
+                String::new(),
+                HashMap::new(),
+            )
+            .await
+        {
+            error!(
+                "Failed to report restart completion for task {}: {}",
+                task_id, e
+            );
+        }
+
+        info!("Agent restart requested, exiting for service manager restart...");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // 使用非零退出码触发服务管理器的 on-failure 自动重启
+        std::process::exit(42);
     }
 }
 

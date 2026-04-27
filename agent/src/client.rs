@@ -84,6 +84,9 @@ pub enum ServerMessage {
         #[serde(default)]
         download_url: Option<String>,
     },
+    AgentRestart {
+        task_id: i64,
+    },
     FetchAgentLog {
         request_id: String,
         #[serde(default = "default_tail_bytes")]
@@ -185,6 +188,11 @@ pub struct AgentUpdateData {
 }
 
 #[derive(Debug, Clone)]
+pub struct AgentRestartData {
+    pub task_id: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct FetchAgentLogData {
     pub request_id: String,
     pub tail_bytes: u64,
@@ -234,6 +242,9 @@ pub enum StateSyncPayload {
         task_id: i64,
         #[serde(default)]
         download_url: Option<String>,
+    },
+    AgentRestart {
+        task_id: i64,
     },
 }
 
@@ -573,11 +584,12 @@ impl AgentClient {
     }
 
     /// 运行客户端主循环
-    pub async fn run<F, G, H, I, J, Fut1, Fut2, Fut3, Fut4, Fut5>(
+    pub async fn run<F, G, H, K, I, J, Fut1, Fut2, Fut3, Fut3b, Fut4, Fut5>(
         &self,
         on_task_dispatch: F,
         on_task_cancel: G,
         on_agent_update: H,
+        on_agent_restart: K,
         on_state_sync_result: I,
         on_task_state_ack: J,
         on_connected: impl Fn() + Send + Sync + Clone + 'static,
@@ -590,6 +602,8 @@ impl AgentClient {
         Fut2: std::future::Future<Output = ()> + Send,
         H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + Clone + 'static,
         Fut3: std::future::Future<Output = ()> + Send + 'static,
+        K: Fn(AgentRestartData) -> Fut3b + Send + Sync + Clone + 'static,
+        Fut3b: std::future::Future<Output = ()> + Send + 'static,
         I: Fn(Vec<StateSyncAction>) -> Fut4 + Send + Sync + Clone + 'static,
         Fut4: std::future::Future<Output = ()> + Send + 'static,
         J: Fn(TaskStateAckData) -> Fut5 + Send + Sync + Clone + 'static,
@@ -603,6 +617,7 @@ impl AgentClient {
                     on_task_dispatch.clone(),
                     on_task_cancel.clone(),
                     on_agent_update.clone(),
+                    on_agent_restart.clone(),
                     on_state_sync_result.clone(),
                     on_task_state_ack.clone(),
                     on_connected.clone(),
@@ -662,11 +677,12 @@ impl AgentClient {
     }
 
     /// 消息接收循环
-    async fn message_loop<F, G, H, I, J, Fut1, Fut2, Fut3, Fut4, Fut5>(
+    async fn message_loop<F, G, H, K, I, J, Fut1, Fut2, Fut3, Fut3b, Fut4, Fut5>(
         &self,
         on_task_dispatch: F,
         on_task_cancel: G,
         on_agent_update: H,
+        on_agent_restart: K,
         on_state_sync_result: I,
         on_task_state_ack: J,
         on_connected: impl Fn() + Send + Sync + Clone + 'static,
@@ -678,6 +694,8 @@ impl AgentClient {
         Fut2: std::future::Future<Output = ()> + Send,
         H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + Clone + 'static,
         Fut3: std::future::Future<Output = ()> + Send + 'static,
+        K: Fn(AgentRestartData) -> Fut3b + Send + Sync + Clone + 'static,
+        Fut3b: std::future::Future<Output = ()> + Send + 'static,
         I: Fn(Vec<StateSyncAction>) -> Fut4 + Send + Sync + Clone + 'static,
         Fut4: std::future::Future<Output = ()> + Send + 'static,
         J: Fn(TaskStateAckData) -> Fut5 + Send + Sync + Clone + 'static,
@@ -815,6 +833,7 @@ impl AgentClient {
                             on_task_dispatch.clone(),
                             on_task_cancel.clone(),
                             on_agent_update.clone(),
+                            on_agent_restart.clone(),
                             on_state_sync_result.clone(),
                             on_task_state_ack.clone(),
                             on_connected.clone(),
@@ -851,12 +870,13 @@ impl AgentClient {
     }
 
     /// 处理接收到的消息
-    async fn handle_message<F, G, H, I, J, Fut1, Fut2, Fut3, Fut4, Fut5>(
+    async fn handle_message<F, G, H, K, I, J, Fut1, Fut2, Fut3, Fut3b, Fut4, Fut5>(
         &self,
         message: ServerMessage,
         on_task_dispatch: F,
         on_task_cancel: G,
         on_agent_update: H,
+        on_agent_restart: K,
         on_state_sync_result: I,
         on_task_state_ack: J,
         on_connected: impl Fn() + Send + Sync + 'static,
@@ -867,6 +887,8 @@ impl AgentClient {
         Fut2: std::future::Future<Output = ()> + Send,
         H: Fn(AgentUpdateData) -> Fut3 + Send + Sync + 'static,
         Fut3: std::future::Future<Output = ()> + Send + 'static,
+        K: Fn(AgentRestartData) -> Fut3b + Send + Sync + 'static,
+        Fut3b: std::future::Future<Output = ()> + Send + 'static,
         I: Fn(Vec<StateSyncAction>) -> Fut4 + Send + Sync + 'static,
         Fut4: std::future::Future<Output = ()> + Send + 'static,
         J: Fn(TaskStateAckData) -> Fut5 + Send + Sync + 'static,
@@ -948,6 +970,13 @@ impl AgentClient {
                 let data = AgentUpdateData { task_id, download_url };
                 tokio::spawn(async move {
                     on_agent_update(data).await;
+                });
+            }
+            ServerMessage::AgentRestart { task_id } => {
+                info!("Received agent restart task {}", task_id);
+                let data = AgentRestartData { task_id };
+                tokio::spawn(async move {
+                    on_agent_restart(data).await;
                 });
             }
             ServerMessage::FetchAgentLog {
