@@ -437,6 +437,130 @@ enum Cli {
     },
 }
 
+/// 自定义日志文件写入器，支持 24 小时自动轮转。
+///
+/// - 启动时：将已有的 `agent.log` 归档为 `agent_{timestamp}.log`
+/// - 运行中：每次写入时检查是否已超过 24 小时，超过则归档并重建
+/// - 每次归档后自动清理旧的归档文件
+struct RotatingAgentLog {
+    dir: PathBuf,
+    file_name: String,
+    /// 不含扩展名的文件名前缀，例如 "agent"
+    stem: String,
+    /// 文件扩展名，例如 "log"
+    ext: String,
+    file: File,
+    created_at: std::time::Instant,
+    max_age: std::time::Duration,
+}
+
+impl RotatingAgentLog {
+    fn new(log_path: &PathBuf) -> std::io::Result<Self> {
+        let dir = log_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let file_name = log_path
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("agent.log"))
+            .to_string_lossy()
+            .to_string();
+        let stem = log_path
+            .file_stem()
+            .unwrap_or(std::ffi::OsStr::new("agent"))
+            .to_string_lossy()
+            .to_string();
+        let ext = log_path
+            .extension()
+            .unwrap_or(std::ffi::OsStr::new("log"))
+            .to_string_lossy()
+            .to_string();
+
+        let _ = fs::create_dir_all(&dir);
+
+        let full_path = dir.join(&file_name);
+
+        // 清理旧的归档文件
+        Self::cleanup_archives(&dir, &stem, &ext);
+
+        // 启动时：将已有的日志文件归档
+        if full_path.exists() {
+            let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+            let archive_name = format!("{}_{}.{}", stem, timestamp, ext);
+            let archive_path = dir.join(&archive_name);
+            let _ = fs::rename(&full_path, &archive_path);
+        }
+
+        // 创建新的日志文件
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&full_path)?;
+
+        Ok(Self {
+            dir,
+            file_name,
+            stem,
+            ext,
+            file,
+            created_at: std::time::Instant::now(),
+            max_age: std::time::Duration::from_secs(24 * 60 * 60),
+        })
+    }
+
+    /// 检查是否需要轮转，超过 24 小时则归档当前文件并创建新文件
+    fn rotate_if_needed(&mut self) -> std::io::Result<()> {
+        if self.created_at.elapsed() < self.max_age {
+            return Ok(());
+        }
+
+        let current_path = self.dir.join(&self.file_name);
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let archive_name = format!("{}_{}.{}", self.stem, timestamp, self.ext);
+        let archive_path = self.dir.join(&archive_name);
+
+        let _ = self.file.flush();
+
+        // 先清理旧归档，再归档当前文件，避免刚归档的文件被清理掉
+        Self::cleanup_archives(&self.dir, &self.stem, &self.ext);
+
+        let _ = fs::rename(&current_path, &archive_path);
+
+        self.file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&current_path)?;
+        self.created_at = std::time::Instant::now();
+
+        Ok(())
+    }
+
+    /// 删除所有旧的归档文件（{stem}_{timestamp}.{ext}）
+    fn cleanup_archives(dir: &PathBuf, stem: &str, ext: &str) {
+        let prefix = format!("{}_", stem);
+        let suffix = format!(".{}", ext);
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) && name.ends_with(&suffix) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
+impl Write for RotatingAgentLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.rotate_if_needed();
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// 配置日志
 ///
 /// 返回的 `WorkerGuard` 必须在程序生命周期内保持存活，
@@ -464,16 +588,15 @@ fn setup_logging(log_level: &str, log_file: Option<&PathBuf>) -> Option<tracing_
         .with_line_number(false);
 
     if let Some(log_path) = log_file {
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let file_appender = tracing_appender::rolling::daily(
-            log_path.parent().unwrap_or(std::path::Path::new(".")),
-            log_path
-                .file_name()
-                .unwrap_or(std::ffi::OsStr::new("agent.log")),
-        );
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let rotating_log = match RotatingAgentLog::new(log_path) {
+            Ok(log) => log,
+            Err(e) => {
+                eprintln!("Failed to initialize log file: {}", e);
+                subscriber.init();
+                return None;
+            }
+        };
+        let (non_blocking, guard) = tracing_appender::non_blocking(rotating_log);
         subscriber.with_writer(non_blocking).init();
         Some(guard)
     } else {
@@ -735,6 +858,7 @@ impl Agent {
         std::fs::create_dir_all(&self.config.workspaces_path)?;
 
         let agent = Arc::new(self);
+
         let agent_clone = agent.clone();
         let agent_cancel = agent.clone();
         let agent_update = agent.clone();

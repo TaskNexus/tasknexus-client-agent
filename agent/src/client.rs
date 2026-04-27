@@ -1015,30 +1015,13 @@ impl AgentClient {
             }
         };
 
-        // tracing_appender::rolling::daily 生成的文件名格式为
-        // {prefix}.{YYYY-MM-DD}，定位当天的日志文件
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let parent = log_file
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let file_stem = log_file
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new("agent.log"));
-        let daily_file = parent.join(format!(
-            "{}.{}",
-            file_stem.to_string_lossy(),
-            today
-        ));
-
-        // 尝试当天的日志文件，如果不存在则尝试原始路径
-        let actual_path = if tokio::fs::try_exists(&daily_file).await.unwrap_or(false) {
-            daily_file
-        } else if tokio::fs::try_exists(&log_file).await.unwrap_or(false) {
+        // 日志文件使用固定文件名（不带日期后缀）
+        let actual_path = if tokio::fs::try_exists(&log_file).await.unwrap_or(false) {
             log_file.clone()
         } else {
             warn!(
-                "fetch_agent_log: log file not found at {:?} or {:?}",
-                daily_file, log_file
+                "fetch_agent_log: log file not found at {:?}",
+                log_file
             );
             let _ = self
                 .send_agent_log_content(
