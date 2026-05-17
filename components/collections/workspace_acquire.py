@@ -59,6 +59,13 @@ class WorkspaceAcquireService(Service):
         client_repo_token = extra_config.get("agent_repo_token", "")
         return client_repo_url, client_repo_ref, client_repo_token
 
+    def _build_prepare_environment(self, agent_environment, pipeline_id):
+        from tasks.third_party_accounts import build_required_auth_environment_for_pipeline
+
+        environment = dict(agent_environment or {}) if isinstance(agent_environment, dict) else {}
+        environment.update(build_required_auth_environment_for_pipeline(pipeline_id))
+        return environment
+
     def _set_system_outputs(
         self,
         data,
@@ -118,6 +125,12 @@ class WorkspaceAcquireService(Service):
         client_repo_ref = data.get_one_of_outputs("_client_repo_ref", "main")
         client_repo_token = data.get_one_of_outputs("_client_repo_token", "")
         pipeline_id = data.get_one_of_outputs("_pipeline_id", "")
+        try:
+            environment = self._build_prepare_environment(agent.environment, pipeline_id)
+        except Exception as exc:
+            data.outputs.ex_data = str(exc)
+            return False
+
         dispatch_payload = {
             "type": "task_dispatch",
             "task_id": None,
@@ -128,7 +141,7 @@ class WorkspaceAcquireService(Service):
             "execution_mode": "command",
             "command": "",
             "timeout": 300,
-            "environment": agent.environment,
+            "environment": environment,
             "prepare_repo_before_execute": True,
             "cleanup_workspace_on_success": False,
         }
@@ -191,6 +204,12 @@ class WorkspaceAcquireService(Service):
         client_repo_url = data.get_one_of_outputs("_client_repo_url", "")
         client_repo_ref = data.get_one_of_outputs("_client_repo_ref", "main")
         client_repo_token = data.get_one_of_outputs("_client_repo_token", "")
+        try:
+            environment = self._build_prepare_environment(agent.environment, pipeline_id)
+        except Exception as exc:
+            data.outputs.ex_data = str(exc)
+            return False
+
         dispatch_payload = {
             "type": "task_dispatch",
             "task_id": None,
@@ -201,7 +220,7 @@ class WorkspaceAcquireService(Service):
             "execution_mode": "command",
             "command": "",
             "timeout": 300,
-            "environment": agent.environment,
+            "environment": environment,
             "prepare_repo_before_execute": True,
             "cleanup_workspace_on_success": False,
         }

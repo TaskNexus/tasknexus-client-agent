@@ -109,6 +109,12 @@ class ClientAgentService(Service):
         return project_environment
 
     @staticmethod
+    def _build_required_auth_environment(pipeline_id):
+        from tasks.third_party_accounts import build_required_auth_environment_for_pipeline
+
+        return build_required_auth_environment_for_pipeline(pipeline_id)
+
+    @staticmethod
     def _normalize_execution_mode(raw_mode):
         mode = str(raw_mode or '').strip().lower()
         if mode == EXECUTION_MODE_CODE:
@@ -344,6 +350,11 @@ class ClientAgentService(Service):
         declared_environment = self._normalize_env_parameters(data.get_one_of_outputs('_declared_environment', {}))
         task_parameters = self._normalize_env_parameters(data.get_one_of_outputs('_parameters', {}))
         base_environment = self._normalize_env_parameters(agent.environment)
+        try:
+            auth_environment = self._build_required_auth_environment(pipeline_id)
+        except Exception as exc:
+            data.outputs.ex_data = str(exc)
+            return False
 
         merged_environment = {
             key: self._stringify_environment_value(value)
@@ -353,6 +364,7 @@ class ClientAgentService(Service):
                 **base_environment,
                 **declared_environment,
                 **task_parameters,
+                **auth_environment,
             }.items()
         }
         dispatch_payload = {
