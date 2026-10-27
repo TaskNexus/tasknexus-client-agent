@@ -20,20 +20,86 @@ fn plist_path(service_name: &str) -> String {
     )
 }
 
-fn log_path(service_name: &str, ext: &str) -> String {
-    format!("/var/log/{}.{}", service_name, ext)
+fn log_path(home: &str, service_name: &str, ext: &str) -> String {
+    format!("{}/Library/Logs/{}.{}", home, service_name, ext)
+}
+
+fn install_account() -> Result<(String, String, String), BoxError> {
+    let user = std::env::var("SUDO_USER").map_err(|_| {
+        "请使用 sudo 安装，服务会以执行 sudo 的用户身份运行".to_string()
+    })?;
+    if user.is_empty() || user == "root" {
+        return Err("请从普通用户执行 sudo 安装，服务不能以 root 运行".into());
+    }
+
+    let home = user_home(&user)?;
+    let group = primary_group(&user)?;
+    let log_dir = format!("{home}/Library/Logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|error| format!("创建日志目录 '{}' 失败: {}", log_dir, error))?;
+    let status = std::process::Command::new("chown")
+        .args([format!("{user}:{group}"), log_dir])
+        .status()
+        .map_err(|error| format!("修改日志目录所有者失败: {}", error))?;
+    if !status.success() {
+        return Err(format!(
+            "修改日志目录所有者失败 (exit {})",
+            status.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    Ok((user, group, home))
+}
+
+fn user_home(user: &str) -> Result<String, BoxError> {
+    let output = std::process::Command::new("dscl")
+        .args([".", "-read", &format!("/Users/{user}"), "NFSHomeDirectory"])
+        .output()
+        .map_err(|error| format!("读取用户 {} 的主目录失败: {}", user, error))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("读取用户 {} 的主目录失败: {}", user, stderr.trim()).into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("NFSHomeDirectory:"))
+        .map(str::trim)
+        .filter(|home| !home.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("用户 {} 没有主目录", user).into())
+}
+
+fn primary_group(user: &str) -> Result<String, BoxError> {
+    let output = std::process::Command::new("id")
+        .args(["-gn", user])
+        .output()
+        .map_err(|error| format!("读取用户 {} 的组失败: {}", user, error))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("读取用户 {} 的组失败: {}", user, stderr.trim()).into());
+    }
+
+    let group = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if group.is_empty() {
+        return Err(format!("用户 {} 没有主组", user).into());
+    }
+    Ok(group)
 }
 
 /// 安装 launchd 服务
 pub fn install_service(service_name: &str, config_path: &Path) -> Result<(), BoxError> {
+    let (user, group, home) = install_account()?;
     let current_exe = std::env::current_exe()?;
     let exe_path = current_exe.to_string_lossy();
     let config_str = config_path.to_string_lossy();
     let display_name = display_name_for(service_name);
     let label = plist_label(service_name);
     let plist = plist_path(service_name);
-    let stdout_log = log_path(service_name, "log");
-    let stderr_log = log_path(service_name, "err");
+    let stdout_log = log_path(&home, service_name, "log");
+    let stderr_log = log_path(&home, service_name, "err");
 
     let plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -66,11 +132,31 @@ pub fn install_service(service_name: &str, config_path: &Path) -> Result<(), Box
   <key>ThrottleInterval</key>
   <integer>5</integer>
 
+  <key>UserName</key>
+  <string>{user}</string>
+
+  <key>GroupName</key>
+  <string>{group}</string>
+
+  <key>InitGroups</key>
+  <true/>
+
   <key>StandardOutPath</key>
   <string>{stdout_log}</string>
 
   <key>StandardErrorPath</key>
   <string>{stderr_log}</string>
+
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>10240</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>10240</integer>
+  </dict>
 </dict>
 </plist>
 "#,
@@ -78,6 +164,8 @@ pub fn install_service(service_name: &str, config_path: &Path) -> Result<(), Box
         exe = exe_path,
         config = config_str,
         svc_name = service_name,
+        user = user,
+        group = group,
         stdout_log = stdout_log,
         stderr_log = stderr_log,
     );
@@ -101,6 +189,7 @@ pub fn install_service(service_name: &str, config_path: &Path) -> Result<(), Box
     println!("服务 '{}' 安装成功", display_name);
     println!("  Plist 文件: {}", plist);
     println!("  配置文件:   {}", config_str);
+    println!("  运行用户:   {}", user);
     println!("  启动类型:   开机自动启动");
     println!();
     println!("使用以下命令管理服务:");
